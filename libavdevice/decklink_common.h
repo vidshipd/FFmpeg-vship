@@ -96,6 +96,7 @@ struct decklink_ctx {
     IDeckLinkInput *dli;
     IDeckLinkConfiguration *cfg;
     IDeckLinkProfileAttributes *attr;
+    IDeckLinkStatus *status;
     decklink_output_callback *output_callback;
 
     /* DeckLink mode information */
@@ -109,6 +110,8 @@ struct decklink_ctx {
     int bmd_height;
     int bmd_field_dominance;
     int supports_vanc;
+    int supports_hdr;
+    int supports_colorspace;
 
     /* Capture buffer queue */
     DecklinkPacketQueue queue;
@@ -117,6 +120,15 @@ struct decklink_ctx {
 
     /* Output VANC queue */
     DecklinkPacketQueue vanc_queue;
+
+    /* Audio output interleaving */
+    pthread_mutex_t audio_mutex;
+    DecklinkPacketQueue output_audio_list;
+    unsigned int audio_pkt_numsamples = 0;
+    int audio_offset;
+    int video_offset;
+    unsigned int audio_samples_per_frame;
+    void *empty_audio_buf;
 
     /* Streams present */
     int audio;
@@ -128,11 +140,17 @@ struct decklink_ctx {
     int64_t last_pts;
     unsigned long frameCount;
     unsigned int dropped;
+    unsigned int late;
+    unsigned int output_restart;
+    unsigned int output_slipped;
     AVStream *audio_st;
     AVStream *video_st;
     AVStream *klv_st;
     AVStream *teletext_st;
     uint16_t cdp_sequence_num;
+    time_t last_refstatus_report;
+    int64_t *audio_st_lastpts; /* Array of last PTS for audio streams */
+    int64_t *audio_st_offset; /* Array of audio delays per stream, Measured in samples */
 
     /* Options */
     int list_devices;
@@ -149,6 +167,13 @@ struct decklink_ctx {
 
     int frames_preroll;
     int frames_buffer;
+    int frames_discard;
+    int thumbnail_frames;
+
+    /* Track hardware video fifo level */
+    int framebuffer_level;
+    int num_framebuffer_level;
+    time_t last_framebuffer_level;
 
     pthread_mutex_t mutex;
     pthread_cond_t cond;

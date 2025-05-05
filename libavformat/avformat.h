@@ -2852,6 +2852,17 @@ int avformat_transfer_internal_stream_timing_info(const AVOutputFormat *ofmt,
 AVRational av_stream_get_codec_timebase(const AVStream *st);
 
 /**
+ * Add a bitstream filter to a stream.
+ *
+ * @param st output stream to add a filter to
+ * @param name the name of the filter to add
+ * @param args filter-specific argument string
+ * @return  >0 on success;
+ *          AVERROR code on failure
+ */
+ int av_stream_add_bitstream_filter(AVStream *st, const char *name, const char *args);
+
+/**
  * @}
  */
 

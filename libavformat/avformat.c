@@ -858,3 +858,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
     *pb = NULL;
     return ret;
 }
+
+int av_stream_add_bitstream_filter(AVStream *st, const char *name, const char *args) 
+{
+    return ff_stream_add_bitstream_filter(st, name, args);
+}

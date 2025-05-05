@@ -36,6 +36,7 @@ extern "C" {
 #include "libavutil/frame.h"
 #include "libavutil/internal.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/time.h"
 #include "avdevice.h"
 }
 
@@ -46,6 +47,14 @@ extern "C" {
 #include "libklvanc/vanc-lines.h"
 #include "libklvanc/pixels.h"
 #endif
+
+/* If the PTS of the latest audio packet is within this number of the previous
+   packet received, just concatenate the blocks.  This is to deal with certain
+   encoders which provide PTS values that are slightly off from the actual number
+   of samples delivered.  Without this, we either introduce small gaps between
+   the audio blocks, or we end up overwriting the last few samples of the previous
+   audio block.  */
+#define AUDIO_PTS_FUDGEFACTOR 15
 
 /* DeckLink callback class declaration */
 class decklink_frame : public IDeckLinkVideoFrame
@@ -138,27 +147,226 @@ private:
     std::atomic<int>  _refs;
 };
 
-class decklink_output_callback : public IDeckLinkVideoOutputCallback
+static void decklink_insert_frame(AVFormatContext *_avctx, struct decklink_cctx *_cctx,
+                                  decklink_frame *frame, int64_t pts, int num_frames)
+{
+    struct decklink_ctx *ctx = (struct decklink_ctx *)_cctx->ctx;
+    uint32_t buffered;
+    uint32_t vid_buffered;
+    BMDTimeValue streamtime;
+    BMDTimeValue vid_streamtime;
+
+    ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
+    ctx->dlo->GetBufferedVideoFrameCount(&vid_buffered);
+    int ret = ctx->dlo->GetScheduledStreamTime(ctx->bmd_tb_den, &vid_streamtime, NULL);
+    if (ret != 0) {
+        av_log(_avctx, AV_LOG_WARNING, "Failed getting streamtime %d\n", ret);
+    }
+
+    av_log(_avctx, AV_LOG_WARNING, "Inserting %d frames (%d) (vid=%d)."
+           " vid_streamtime=%ld.  Advancing %d audio samples\n",
+           num_frames, buffered, vid_buffered,
+           vid_streamtime / ctx->bmd_tb_num,
+           ctx->audio_samples_per_frame * num_frames);
+
+    ctx->dlo->GetScheduledStreamTime(48000, &streamtime, NULL);
+    for (int i = 0; i < num_frames; i++) {
+        uint32_t written;
+        HRESULT result;
+
+        pthread_mutex_lock(&ctx->mutex);
+        while (ctx->frames_buffer_available_spots == 0) {
+            pthread_cond_wait(&ctx->cond, &ctx->mutex);
+        }
+        ctx->frames_buffer_available_spots--;
+        pthread_mutex_unlock(&ctx->mutex);
+
+        ctx->video_offset++;
+        ctx->frameCount++;
+        result = ctx->dlo->ScheduleVideoFrame((class IDeckLinkVideoFrame *) frame,
+                                              (pts + ctx->video_offset) * ctx->bmd_tb_num,
+                                              ctx->bmd_tb_num, ctx->bmd_tb_den);
+        if (result != S_OK) {
+            av_log(_avctx, AV_LOG_ERROR, "Failed to schedule video frame: %d\n",
+                   result);
+        }
+        result = ctx->dlo->ScheduleAudioSamples(ctx->empty_audio_buf,
+                                                ctx->audio_samples_per_frame, streamtime + buffered,
+                                                bmdAudioSampleRate48kHz,
+                                                &written);
+        if (result != S_OK) {
+            av_log(_avctx, AV_LOG_ERROR, "Failed to schedule audio: %d written=%d\n",
+                   result, written);
+        } else if (written != ctx->audio_samples_per_frame) {
+            av_log(_avctx, AV_LOG_ERROR, "Audio write failure: requested=%d written=%d\n",
+                   ctx->audio_samples_per_frame, written);
+        }
+
+        ctx->audio_offset += ctx->audio_samples_per_frame;
+        buffered += ctx->audio_samples_per_frame;
+    }
+}
+
+static void decklink_drop_frame(AVFormatContext *_avctx, struct decklink_cctx *_cctx,
+                                int num_frames)
+{
+    struct decklink_ctx *ctx = (struct decklink_ctx *)_cctx->ctx;
+    uint32_t buffered;
+    uint32_t vid_buffered;
+
+    ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
+    ctx->dlo->GetBufferedVideoFrameCount(&vid_buffered);
+    av_log(_avctx, AV_LOG_WARNING, "Dropping %d frames (%d) (vid=%d).\n",
+           num_frames, buffered, vid_buffered);
+
+    ctx->video_offset -= num_frames;
+    ctx->audio_offset -= ctx->audio_samples_per_frame * num_frames;
+}
+
+class decklink_output_callback : public IDeckLinkVideoOutputCallback, public IDeckLinkAudioOutputCallback
 {
 public:
+    AVFormatContext *_avctx;
+    int64_t last_audio_callback;
+
+    decklink_output_callback(AVFormatContext *avctx) : _avctx(avctx), last_audio_callback(0) {}
     virtual HRESULT STDMETHODCALLTYPE ScheduledFrameCompleted(IDeckLinkVideoFrame *_frame, BMDOutputFrameCompletionResult result)
     {
         decklink_frame *frame = static_cast<decklink_frame *>(_frame);
         struct decklink_ctx *ctx = frame->_ctx;
-
-        if (frame->_avframe)
-            av_frame_unref(frame->_avframe);
-        if (frame->_avpacket)
-            av_packet_unref(frame->_avpacket);
 
         pthread_mutex_lock(&ctx->mutex);
         ctx->frames_buffer_available_spots++;
         pthread_cond_broadcast(&ctx->cond);
         pthread_mutex_unlock(&ctx->mutex);
 
+        switch (result) {
+        case bmdOutputFrameCompleted:
+        case bmdOutputFrameFlushed:
+            break;
+        case bmdOutputFrameDisplayedLate:
+            ctx->late++;
+            av_log(_avctx, AV_LOG_WARNING, "Video buffer late\n");
+            break;
+        case bmdOutputFrameDropped:
+            ctx->dropped++;
+            av_log(_avctx, AV_LOG_WARNING, "Video buffer dropped\n");
+            break;
+        }
+
         return S_OK;
     }
     virtual HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped(void)       { return S_OK; }
+    virtual HRESULT STDMETHODCALLTYPE RenderAudioSamples (BOOL preroll)
+    {
+        struct decklink_cctx *cctx = (struct decklink_cctx *)_avctx->priv_data;
+        struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+        PacketListEntry *cur;
+        BMDTimeValue streamtime;
+
+        /* Make sure the callback is firing on schedule.  It may not be if the system is
+           heavily loaded */
+        if (cctx->debug_level >= 1) {
+            int64_t current_run = av_gettime_relative();
+            if (!preroll && last_audio_callback != 0 &&
+                ((current_run - last_audio_callback > 25000) ||
+                 (current_run - last_audio_callback < 18000)) ) {
+                av_log(_avctx, AV_LOG_ERROR, "Audio callback not firing on schedule.  last=%ld current=%ld delta=%ld\n",
+                       last_audio_callback, current_run, current_run - last_audio_callback);
+            }
+            last_audio_callback = current_run;
+        }
+
+        pthread_mutex_lock(&ctx->audio_mutex);
+
+        ctx->dlo->GetScheduledStreamTime(48000, &streamtime, NULL);
+        uint32_t buffered;
+        ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
+
+        /* Do final Scheduling of audio at least 50ms before deadline.  This ensures there
+           was enough time for multiple audio streams to be interleaved, while sending to
+           the hardware with enough time for actual output. */
+        int64_t window = streamtime + (bmdAudioSampleRate48kHz * 50 / 1000);
+
+        if (preroll && ctx->audio_pkt_numsamples) {
+            /* Throw away everything but the most recent 500ms.  This is to prevent
+               failures that occur if you attempt to schedule more than 1 second of audio. */
+            int total_pkts = 0;
+            int keep_pkts = (bmdAudioSampleRate48kHz / 2) / ctx->audio_pkt_numsamples;
+            int throwaway = 0;
+            for (cur = ctx->output_audio_list.pkt_list.head; cur != NULL; cur = cur->next)
+                total_pkts++;
+
+            if (total_pkts > keep_pkts)
+                throwaway = total_pkts - keep_pkts;
+
+            while (throwaway > 0) {
+                AVPacket pkt;
+                ff_decklink_packet_queue_get(&ctx->output_audio_list, &pkt, 1);
+                av_packet_unref(&pkt);
+                throwaway--;
+            }
+        }
+
+        while (1) {
+            AVPacket pkt;
+            int64_t cur_pts;
+
+            cur_pts = ff_decklink_packet_queue_peekpts(&ctx->output_audio_list);
+
+            if (cctx->debug_level >= 4 && preroll == 0)
+                av_log(_avctx, AV_LOG_INFO, "Considering audio: pts=%ld ns=%d streamtime=%ld window=%ld next=%p delta=%ld buffered=%d\n",
+                       cur_pts, ctx->audio_pkt_numsamples, streamtime, window, cur->next, window - cur_pts, buffered);
+
+            if (cur_pts == -1 || (cur_pts > window) && !preroll)
+                break;
+
+            ff_decklink_packet_queue_get(&ctx->output_audio_list, &pkt, 1);
+
+            if (cctx->debug_level >= 4)
+                av_log(_avctx, AV_LOG_INFO, "Scheduling audio: pts=%ld ns=%d streamtime=%ld window=%ld\n",
+                       pkt.pts, ctx->audio_pkt_numsamples, streamtime, window);
+
+            uint32_t written;
+            HRESULT result = ctx->dlo->ScheduleAudioSamples(pkt.data,
+                                                            ctx->audio_pkt_numsamples, pkt.pts,
+                                                            bmdAudioSampleRate48kHz,
+                                                            &written);
+            if (result != S_OK) {
+                av_log(_avctx, AV_LOG_ERROR, "Failed to schedule audio: %d written=%d\n",
+                       result, written);
+            } else if (written != ctx->audio_pkt_numsamples) {
+                av_log(_avctx, AV_LOG_ERROR, "Audio write failure: pts=%ld requested=%d written=%d\n",
+                       cur->pkt.pts, ctx->audio_pkt_numsamples, written);
+            }
+
+            av_packet_unref(&pkt);
+        }
+
+        if (!preroll) {
+            uint32_t buffered;
+            uint32_t vid_buffered;
+            BMDTimeValue vid_streamtime;
+
+            ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
+            ctx->dlo->GetBufferedVideoFrameCount(&vid_buffered);
+            int ret = ctx->dlo->GetScheduledStreamTime(ctx->bmd_tb_den, &vid_streamtime, NULL);
+            if (ret != 0) {
+                av_log(_avctx, AV_LOG_WARNING, "Failed getting streamtime %d\n", ret);
+            }
+
+            if (ctx->playback_started && buffered < (48000 / 50)){
+                av_log(_avctx, AV_LOG_WARNING, "There's insufficient buffered audio (%d) (vid=%d)."
+                       " Audio will misbehave! vid_streamtime=%ld\n", buffered, vid_buffered,
+                       vid_streamtime / ctx->bmd_tb_num);
+            }
+        }
+
+        pthread_mutex_unlock(&ctx->audio_mutex);
+
+        return S_OK;
+    }
+
     virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) { return E_NOINTERFACE; }
     virtual ULONG   STDMETHODCALLTYPE AddRef(void)                            { return 1; }
     virtual ULONG   STDMETHODCALLTYPE Release(void)                           { return 1; }
@@ -210,17 +418,28 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     }
 
     /* Set callback. */
-    ctx->output_callback = new decklink_output_callback();
+    ctx->output_callback = new decklink_output_callback(avctx);
     ctx->dlo->SetScheduledFrameCompletionCallback(ctx->output_callback);
+    ctx->dlo->SetAudioCallback(ctx->output_callback);
+    ctx->audio_samples_per_frame = bmdAudioSampleRate48kHz * st->time_base.num / st->time_base.den;
 
-    ctx->frames_preroll = st->time_base.den * ctx->preroll;
-    if (st->time_base.den > 1000)
-        ctx->frames_preroll /= 1000;
+    ctx->frames_preroll = ceil(st->time_base.den * ctx->preroll / st->time_base.num);
+    if (ctx->frames_preroll < 3) {
+        /* No matter what they specify as the preroll, we can't support lower than three
+           frames due to the way the hardware queueing works */
+        ctx->frames_preroll = 3;
+    }
 
     /* Buffer twice as many frames as the preroll. */
+    ctx->frames_preroll = FFMIN(ctx->frames_preroll, 30);
     ctx->frames_buffer = ctx->frames_preroll * 2;
-    ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
+
+    /* Throw the first X frames so that all upstream FIFOs have the opportunity
+       to flush (to reduce realtime latency) */
+    ctx->frames_discard = st->time_base.den * cctx->discard / st->time_base.num;
+
     pthread_mutex_init(&ctx->mutex, NULL);
+    pthread_mutex_init(&ctx->audio_mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
 
@@ -241,32 +460,49 @@ static int decklink_setup_audio(AVFormatContext *avctx, AVStream *st)
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     AVCodecParameters *c = st->codecpar;
 
-    if (ctx->audio) {
-        av_log(avctx, AV_LOG_ERROR, "Only one audio stream is supported!\n");
-        return -1;
-    }
-
     if (c->codec_id == AV_CODEC_ID_AC3) {
         /* Regardless of the number of channels in the codec, we're only
            using 2 SDI audio channels at 48000Hz */
-        ctx->channels = 2;
+        ctx->channels += 2;
     } else if (c->codec_id == AV_CODEC_ID_PCM_S16LE) {
         if (c->sample_rate != 48000) {
             av_log(avctx, AV_LOG_ERROR, "Unsupported sample rate!"
                    " Only 48kHz is supported.\n");
             return -1;
         }
-        if (c->ch_layout.nb_channels != 2 && c->ch_layout.nb_channels != 8 && c->ch_layout.nb_channels != 16) {
-            av_log(avctx, AV_LOG_ERROR, "Unsupported number of channels!"
-                   " Only 2, 8 or 16 channels are supported.\n");
-            return -1;
-        }
-        ctx->channels = c->ch_layout.nb_channels;
+        ctx->channels += c->ch_layout.nb_channels;
     } else {
         av_log(avctx, AV_LOG_ERROR, "Unsupported codec specified!"
                " Only PCM_S16LE and AC-3 are supported.\n");
         return -1;
     }
+
+    /* The device expects the sample rate to be fixed. */
+    avpriv_set_pts_info(st, 64, 1, 48000);
+
+    ctx->audio++;
+
+    return 0;
+}
+
+static int decklink_enable_audio(AVFormatContext *avctx)
+{
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+
+    /* Round up total channel count to that supported by decklink.  This
+       means we may need to pad the output buffer when interleaving the
+       audio packet data... */
+    if (ctx->channels <= 2)
+        ctx->channels = 2;
+    else if (ctx->channels <= 8)
+        ctx->channels = 8;
+    else if (ctx->channels <= 16)
+        ctx->channels = 16;
+
+    ctx->empty_audio_buf = malloc(ctx->audio_samples_per_frame * ctx->channels * 2);
+    if (!ctx->empty_audio_buf)
+        return -1;
 
     if (ctx->dlo->EnableAudioOutput(bmdAudioSampleRate48kHz,
                                     bmdAudioSampleType16bitInteger,
@@ -275,15 +511,6 @@ static int decklink_setup_audio(AVFormatContext *avctx, AVStream *st)
         av_log(avctx, AV_LOG_ERROR, "Could not enable audio output!\n");
         return -1;
     }
-    if (ctx->dlo->BeginAudioPreroll() != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not begin audio preroll!\n");
-        return -1;
-    }
-
-    /* The device expects the sample rate to be fixed. */
-    avpriv_set_pts_info(st, 64, 1, 48000);
-
-    ctx->audio = 1;
 
     return 0;
 }
@@ -353,8 +580,17 @@ static int decklink_setup_data(AVFormatContext *avctx, AVStream *st)
     switch(st->codecpar->codec_id) {
 #if CONFIG_LIBKLVANC
     case AV_CODEC_ID_SMPTE_2038:
+    case AV_CODEC_ID_SCTE_104:
         /* No specific setup required */
         ret = 0;
+        break;
+    case AV_CODEC_ID_SCTE_35:
+        if (av_stream_add_bitstream_filter(st, "scte35toscte104", NULL) > 0) {
+            st->codecpar->codec_id = AV_CODEC_ID_SCTE_104;
+            ret = 0;
+        } else {
+            av_log(avctx, AV_LOG_ERROR, "SCTE-35 requires scte35toscte104 BSF to be available\n");
+        }
         break;
 #endif
     default:
@@ -379,6 +615,9 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
             ctx->dlo->DisableAudioOutput();
     }
 
+    av_log(avctx, AV_LOG_INFO, "Final stats: late=%d dropped=%d vo=%d ao=%d\n",
+           ctx->late, ctx->dropped, ctx->video_offset, ctx->audio_offset);
+
     ff_decklink_cleanup(avctx);
 
     if (ctx->output_callback)
@@ -386,6 +625,8 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
 
     pthread_mutex_destroy(&ctx->mutex);
     pthread_cond_destroy(&ctx->cond);
+    av_freep(&ctx->audio_st_lastpts);
+    av_freep(&ctx->audio_st_offset);
 
 #if CONFIG_LIBKLVANC
     klvanc_context_destroy(ctx->vanc_ctx);
@@ -402,12 +643,16 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
 static void construct_cc(AVFormatContext *avctx, struct decklink_ctx *ctx,
                          AVPacket *pkt, struct klvanc_line_set_s *vanc_lines)
 {
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct klvanc_packet_eia_708b_s *cdp;
     uint16_t *cdp_words;
     uint16_t len;
     uint8_t cc_count;
     size_t size;
     int ret, i;
+
+    if (cctx->cea708_line == -1)
+        return;
 
     const uint8_t *data = av_packet_get_side_data(pkt, AV_PKT_DATA_A53_CC, &size);
     if (!data)
@@ -421,7 +666,7 @@ static void construct_cc(AVFormatContext *avctx, struct decklink_ctx *ctx,
 
     ret = klvanc_set_framerate_EIA_708B(cdp, ctx->bmd_tb_num, ctx->bmd_tb_den);
     if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Invalid framerate specified: %" PRId64 "/%" PRId64 "\n",
+        av_log(avctx, AV_LOG_ERROR, "Invalid framerate specified: %lld/%lld\n",
                ctx->bmd_tb_num, ctx->bmd_tb_den);
         klvanc_destroy_eia708_cdp(cdp);
         return;
@@ -452,7 +697,7 @@ static void construct_cc(AVFormatContext *avctx, struct decklink_ctx *ctx,
         return;
     }
 
-    ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, cdp_words, len, 11, 0);
+    ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, cdp_words, len, cctx->cea708_line, 0);
     free(cdp_words);
     if (ret != 0) {
         av_log(avctx, AV_LOG_ERROR, "VANC line insertion failed\n");
@@ -465,11 +710,15 @@ static void construct_afd(AVFormatContext *avctx, struct decklink_ctx *ctx,
                           AVPacket *pkt, struct klvanc_line_set_s *vanc_lines,
                           AVStream *st)
 {
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct klvanc_packet_afd_s *afd = NULL;
     uint16_t *afd_words = NULL;
     uint16_t len;
     size_t size;
-    int f1_line = 12, f2_line = 0, ret;
+    int f1_line = cctx->afd_line, f2_line = 0, ret;
+
+    if (cctx->afd_line == -1)
+        return;
 
     const uint8_t *data = av_packet_get_side_data(pkt, AV_PKT_DATA_AFD, &size);
     if (!data || size == 0)
@@ -564,6 +813,7 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
                                    AVStream *st)
 {
     struct klvanc_line_set_s vanc_lines = { 0 };
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     int ret = 0, i;
 
     if (!ctx->supports_vanc)
@@ -621,6 +871,57 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
                 }
             }
             klvanc_smpte2038_anc_data_packet_free(pkt_2038);
+        } else if (vanc_st->codecpar->codec_id == AV_CODEC_ID_SCTE_104) {
+	    /* SCTE-104 packets cannot be directly embedded into SDI.  They needs to
+               be encapsulated in SMPTE 2010 first) */
+            uint8_t *smpte2010_bytes;
+            uint16_t smpte2010_len;
+
+            if (cctx->scte104_line == -1) {
+                av_packet_unref(&vanc_pkt);
+                continue;
+            }
+
+            /* There is a known limitation in the libklvanc ST2010 generator where it
+               cannot create payloads that span multiple packets.  For now just discard
+               those messages */
+            if (vanc_pkt.size > 254) {
+                av_log(avctx, AV_LOG_INFO,
+                       "SCTE-104 message exceeds ST2010 maximum and cannot be output.  Size=%d\n",
+                       vanc_pkt.size);
+                av_packet_unref(&vanc_pkt);
+                continue;
+            }
+
+            ret = klvanc_convert_SCTE_104_packetbytes_to_SMPTE_2010(ctx->vanc_ctx,
+                                                                    vanc_pkt.data,
+                                                                    vanc_pkt.size,
+                                                                    &smpte2010_bytes,
+                                                                    &smpte2010_len);
+            if (ret != 0) {
+                av_log(avctx, AV_LOG_ERROR, "Error creating SMPTE 2010 VANC payload, ret=%d\n",
+                       ret);
+                break;
+            }
+
+            /* Generate a VANC line for SCTE104 message */
+            uint16_t *vancWords = NULL;
+            uint16_t vancWordCount;
+            ret = klvanc_sdi_create_payload(0x07, 0x41, smpte2010_bytes, smpte2010_len,
+                                            &vancWords, &vancWordCount, 10);
+            free(smpte2010_bytes);
+            if (ret != 0) {
+                av_log(avctx, AV_LOG_ERROR, "Error creating SCTE-104 VANC payload, ret=%d\n",
+                       ret);
+                break;
+            }
+            ret = klvanc_line_insert(ctx->vanc_ctx, &vanc_lines, vancWords,
+                                     vancWordCount, cctx->scte104_line, 0);
+            free(vancWords);
+            if (ret != 0) {
+                av_log(avctx, AV_LOG_ERROR, "VANC line insertion failed\n");
+                break;
+            }
         }
         av_packet_unref(&vanc_pkt);
     }
@@ -690,6 +991,50 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     ctx->last_pts = FFMAX(ctx->last_pts, pkt->pts);
 
+    BMDTimeValue streamtime;
+    int64_t delta;
+    ctx->dlo->GetScheduledStreamTime(ctx->bmd_tb_den, &streamtime, NULL);
+    delta = pkt->pts + ctx->video_offset - (streamtime / ctx->bmd_tb_num);
+
+    if (ctx->frames_discard-- > 0) {
+        av_log(avctx, AV_LOG_DEBUG, "Discarding frame with PTS %" PRId64 " discard=%d\n",
+               pkt->pts, ctx->frames_discard);
+        av_frame_free(&avframe);
+        av_packet_free(&avpacket);
+        return 0;
+    }
+
+    if (ctx->playback_started && (delta < 0 || delta > ctx->frames_buffer)) {
+        /* We're behind realtime, or way too far ahead, so restart clocks */
+        av_log(avctx, AV_LOG_ERROR, "Scheduled frames received too %s.  "
+               "Restarting output.  Delta=%" PRId64 "\n", delta < 0 ? "late" : "far into future", delta);
+        if (ctx->dlo->StopScheduledPlayback(0, NULL, 0) != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to stop scheduled playback\n");
+            return AVERROR(EIO);
+        }
+        if (ctx->audio) {
+            ctx->dlo->DisableAudioOutput();
+            free(ctx->empty_audio_buf);
+        }
+
+        ctx->frames_discard = st->time_base.den * cctx->discard / st->time_base.num;
+        ctx->first_pts = AV_NOPTS_VALUE;
+        ctx->playback_started = 0;
+        ctx->audio_offset = 0;
+        ctx->video_offset = 0;
+        ctx->framebuffer_level = 0;
+        ctx->num_framebuffer_level = 0;
+        if (ctx->audio)
+            if (decklink_enable_audio(avctx)) {
+                av_log(avctx, AV_LOG_ERROR, "Error enabling audio\n");
+            }
+
+        /* Bail out after discarding the frame */
+        av_frame_free(&avframe);
+        av_packet_free(&avpacket);
+        return 0;
+    }
+
     if (st->codecpar->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
         if (tmp->format != AV_PIX_FMT_UYVY422 ||
             tmp->width  != ctx->bmd_width ||
@@ -739,9 +1084,57 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         ctx->first_pts = pkt->pts;
 
     /* Schedule frame for playback. */
+    ctx->frameCount++;
     hr = ctx->dlo->ScheduleVideoFrame((class IDeckLinkVideoFrame *) frame,
-                                      pkt->pts * ctx->bmd_tb_num,
+                                      (pkt->pts + ctx->video_offset) * ctx->bmd_tb_num,
                                       ctx->bmd_tb_num, ctx->bmd_tb_den);
+
+    ctx->dlo->GetBufferedVideoFrameCount(&buffered);
+    if (cctx->debug_level >= 3)
+        av_log(avctx, AV_LOG_INFO, "Buffered video frames: %d (offset=%d) pts=%ld streamtime=%ld latency=%ld\n",
+               (int) buffered, ctx->video_offset, pkt->pts, (streamtime / ctx->bmd_tb_num),
+               (pkt->pts + ctx->video_offset) - (streamtime / ctx->bmd_tb_num));
+
+    if (pkt->pts > (ctx->first_pts + 2) && buffered <= 2)
+        av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
+               " Video may misbehave!\n");
+
+
+    /* Make sure there is at least 60ms worth of data */
+    int num_frames = (60 * ctx->bmd_tb_den / ctx->bmd_tb_num / 1000) + 1;
+    if (pkt->pts > (ctx->first_pts + num_frames) && buffered <= num_frames) {
+        av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames to support audio."
+               " Video/audio may misbehave!\n");
+    }
+
+    /* Adjust number of buffers queued to closely track preroll depth (to achieve
+       desired target latency).  Because we only move up to one frame per minute, this is
+       intended to compesnate for SDI clocks which are slightly too slow or too fast
+       (i.e. milliseconds per hour of drift).  */
+    time_t cur_time;
+    time(&cur_time);
+    if (cctx->decklink_live && ctx->last_framebuffer_level != cur_time) {
+        ctx->framebuffer_level += buffered;
+        ctx->num_framebuffer_level++;
+        if (ctx->num_framebuffer_level > 59) {
+            /* It's been a minute, compute the average */
+            float fb_level = (float) ctx->framebuffer_level / (float) ctx->num_framebuffer_level;
+            if (cctx->debug_level >= 1)
+                av_log(avctx, AV_LOG_INFO, "Latency slipper: %d/%d=%f\n", ctx->framebuffer_level,
+                       ctx->num_framebuffer_level, fb_level);
+            if (fb_level > ctx->frames_preroll + 1) {
+                /* Drop a frame to bring us closer to expected latency level */
+                decklink_drop_frame(avctx, cctx, 1);
+            } else if (fb_level < ctx->frames_preroll - 1) {
+                decklink_insert_frame(avctx, cctx, frame, pkt->pts, 1);
+            }
+
+            ctx->framebuffer_level = 0;
+            ctx->num_framebuffer_level = 0;
+        }
+        ctx->last_framebuffer_level = cur_time;
+    }
+
     /* Pass ownership to DeckLink, or release on failure */
     frame->Release();
     if (hr != S_OK) {
@@ -757,18 +1150,35 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
                " Video may misbehave!\n");
 
     /* Preroll video frames. */
-    if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
-        av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
-        if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
-            return AVERROR(EIO);
+    if (!ctx->playback_started) {
+        if (pkt->pts >= (ctx->first_pts + ctx->frames_preroll - 3)) {
+            /* We're about to start playback so start audio preroll */
+            av_log(avctx, AV_LOG_DEBUG, "Starting audio preroll...\n");
+            if (ctx->audio && ctx->dlo->BeginAudioPreroll() != S_OK) {
+                av_log(avctx, AV_LOG_ERROR, "Could not begin audio preroll!\n");
+                return -1;
+            }
         }
-        av_log(avctx, AV_LOG_DEBUG, "Starting scheduled playback.\n");
-        if (ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num, ctx->bmd_tb_den, 1.0) != S_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Could not start scheduled playback!\n");
-            return AVERROR(EIO);
+        if (!ctx->playback_started && pkt->pts >= (ctx->first_pts + ctx->frames_preroll - 1)) {
+            if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
+                av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
+                return AVERROR(EIO);
+            }
+            av_log(avctx, AV_LOG_DEBUG, "Starting scheduled playback.\n");
+            if (ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num, ctx->bmd_tb_den, 1.0) != S_OK) {
+                av_log(avctx, AV_LOG_ERROR, "Could not start scheduled playback!\n");
+                return AVERROR(EIO);
+            }
+            ctx->playback_started = 1;
         }
-        ctx->playback_started = 1;
+    }
+
+    /* Once per second, update the reported status of the Reference Input */
+    time(&cur_time);
+    if (ctx->last_refstatus_report != cur_time) {
+        int64_t ref_mode = 0;
+        ctx->status->GetInt(bmdDeckLinkStatusReferenceSignalMode, &ref_mode);
+        ctx->last_refstatus_report = cur_time;
     }
 
     return 0;
@@ -779,13 +1189,37 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     AVStream *st = avctx->streams[pkt->stream_index];
+    AVCodecParameters *c = st->codecpar;
+    AVPacket pkt_new, *cur_pkt;
     int sample_count;
     uint32_t buffered;
     uint8_t *outbuf = NULL;
+    int interleave_offset = 0;
+    int sample_offset, sample_size;
+    struct PacketListEntry *cur;
+    int src_offset, remaining;
+    int64_t cur_pts;
     int ret = 0;
 
+    /* Audio offset by stream */
+    pkt->pts += ctx->audio_st_offset[pkt->stream_index];
+
+    if (ctx->audio_st_lastpts[pkt->stream_index] != pkt->pts) {
+        int64_t delta = pkt->pts - ctx->audio_st_lastpts[pkt->stream_index];
+
+        if (cctx->debug_level >= 1 && ctx->audio_st_lastpts[pkt->stream_index] != 0) {
+            av_log(avctx, AV_LOG_INFO, "Audio packet discontinuity expected=%ld received=%ld\n",
+                   ctx->audio_st_lastpts[pkt->stream_index], pkt->pts);
+        }
+        if (delta > -AUDIO_PTS_FUDGEFACTOR && delta < AUDIO_PTS_FUDGEFACTOR) {
+            /* Within the fudge factor, so just slip the packet's
+               pts to match the where the last call left off */
+            pkt->pts = ctx->audio_st_lastpts[pkt->stream_index];
+        }
+    }
+
     ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
-    if (pkt->pts > 1 && !buffered)
+    if (ctx->playback_started && !buffered)
         av_log(avctx, AV_LOG_WARNING, "There's no buffered audio."
                " Audio will misbehave!\n");
 
@@ -795,17 +1229,114 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
         ret = create_s337_payload(pkt, &outbuf, &outbuf_size);
         if (ret < 0)
             return ret;
-        sample_count = outbuf_size / 4;
+        sample_size = 4;
+        sample_count = outbuf_size / sample_size;
     } else {
-        sample_count = pkt->size / (ctx->channels << 1);
+        sample_size = c->ch_layout.nb_channels * 2;
+        sample_count = pkt->size / sample_size;
         outbuf = pkt->data;
     }
 
-    if (ctx->dlo->ScheduleAudioSamples(outbuf, sample_count, pkt->pts,
-                                       bmdAudioSampleRate48kHz, NULL) != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not schedule audio samples.\n");
-        ret = AVERROR(EIO);
+    /* Figure out the interleaving offset for this stream */
+    for (int i = 0; i < pkt->stream_index; i++) {
+        AVStream *audio_st = avctx->streams[i];
+        if (audio_st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            if (audio_st->codecpar->codec_id == AV_CODEC_ID_AC3)
+                interleave_offset += 2;
+            else
+                interleave_offset += audio_st->codecpar->ch_layout.nb_channels;
     }
+
+    /* Compute the dBFS for the audio channels in this stream */
+    for (int i = 0; i < st->codecpar->ch_layout.nb_channels; i++) {
+        int16_t largest_sample = 0;
+        float dbfs, val;
+        /* Find largest sample */
+        int sample_offset = 0;
+        for (int j = 0; j < sample_count; j++) {
+            int offset = sample_offset + (i * 2);
+            int16_t samp = outbuf[offset] | (outbuf[offset + 1] << 8);
+            if (largest_sample < samp) {
+                largest_sample = samp;
+            }
+            sample_offset += sample_size;
+        }
+        if (largest_sample == 0) {
+            dbfs = -60;
+        } else {
+            val = largest_sample;
+            dbfs = 20 * log10(val / 32767.0);
+        }
+    }
+
+    pthread_mutex_lock(&ctx->audio_mutex);
+    if (ctx->audio_pkt_numsamples == 0) {
+        /* Establish initial cadence */
+        ff_decklink_packet_queue_init(avctx, &ctx->output_audio_list, cctx->audio_queue_size);
+        if (cctx->debug_level >= 1)
+            av_log(avctx, AV_LOG_INFO, "Initial cadence audio sample count=%d\n", sample_count);
+        ctx->audio_pkt_numsamples = sample_count;
+    }
+
+    if (ff_decklink_packet_queue_size(&ctx->output_audio_list) == 0) {
+        ret = av_new_packet(&pkt_new, ctx->audio_pkt_numsamples * ctx->channels * 2);
+        if (ret != 0)
+            goto done_unlock;
+        memset(pkt_new.data, 0, ctx->audio_pkt_numsamples * ctx->channels * 2);
+        pkt_new.pts = pkt->pts;
+        ff_decklink_packet_queue_put(&ctx->output_audio_list, &pkt_new);
+    }
+
+    cur_pts = ff_decklink_packet_queue_peekpts(&ctx->output_audio_list);
+    if (pkt->pts < cur_pts) {
+        /* Older than the first packet in the list, so we will end up throwing it away */
+        av_log(avctx, AV_LOG_WARNING, "Audio packet too old, discarding.  PTS=%ld first=%ld\n",
+               pkt->pts, cur_pts);
+    }
+
+    remaining = sample_count;
+    src_offset = 0;
+    for (cur = ctx->output_audio_list.pkt_list.head; cur != NULL; cur = cur->next) {
+        /* See if we should interleave into this packet */
+        cur_pkt = &cur->pkt;
+        if (((pkt->pts) >= cur_pkt->pts) &&
+            (pkt->pts) < (cur->pkt.pts + ctx->audio_pkt_numsamples)) {
+            unsigned int num_copy = remaining;
+            unsigned int dst_offset = pkt->pts - cur->pkt.pts;
+
+            /* Don't overflow dest buffer */
+            if (num_copy > (ctx->audio_pkt_numsamples - dst_offset))
+                num_copy = ctx->audio_pkt_numsamples - dst_offset;
+
+            /* Yes, interleave */
+            sample_offset = (dst_offset * ctx->channels + interleave_offset) * 2;
+            for (unsigned int i = 0; i < num_copy; i++) {
+                memcpy(&cur->pkt.data[sample_offset], &outbuf[(i + src_offset) * sample_size], sample_size);
+                sample_offset += (ctx->channels * 2);
+            }
+            pkt->pts += num_copy;
+            src_offset += num_copy;
+            remaining -= num_copy;
+            if (remaining == 0)
+                break;
+        }
+
+        if ((pkt->pts >= cur->pkt.pts) && cur->next == NULL && remaining > 0) {
+            /* We need a new packet in our outgoing queue */
+            ret = av_new_packet(&pkt_new, ctx->audio_pkt_numsamples * ctx->channels * 2);
+            if (ret != 0)
+                goto done_unlock;
+            memset(pkt_new.data, 0, ctx->audio_pkt_numsamples * ctx->channels * 2);
+            pkt_new.pts = cur->pkt.pts + ctx->audio_pkt_numsamples;
+            ff_decklink_packet_queue_put(&ctx->output_audio_list, &pkt_new);
+        }
+    }
+
+    /* Stash the last PTS for the next call */
+    ctx->audio_st_lastpts[pkt->stream_index] = pkt->pts;
+
+done_unlock:
+    pthread_mutex_unlock(&ctx->audio_mutex);
 
     if (st->codecpar->codec_id == AV_CODEC_ID_AC3)
         av_freep(&outbuf);
@@ -899,12 +1430,9 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
         } else if (c->codec_type == AVMEDIA_TYPE_VIDEO) {
             if (decklink_setup_video(avctx, st))
                 goto error;
-        } else if (c->codec_type == AVMEDIA_TYPE_DATA) {
-            if (decklink_setup_data(avctx, st))
-                goto error;
-        } else if (c->codec_type == AVMEDIA_TYPE_SUBTITLE) {
-            if (decklink_setup_subtitle(avctx, st))
-                goto error;
+        } else if (c->codec_type == AVMEDIA_TYPE_DATA ||
+                   c->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            /* Do nothing (we initialize those streams later) */
         } else {
             av_log(avctx, AV_LOG_ERROR, "Unsupported stream type.\n");
             goto error;
@@ -920,12 +1448,87 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
            c->codec_type == AVMEDIA_TYPE_SUBTITLE)
             avpriv_set_pts_info(st, 64, ctx->bmd_tb_num, ctx->bmd_tb_den);
     }
+
+/* Now that video has been setup and the time_base has been set for any
+       data/subtitle streams, do the setup.  This ensures that any automatically
+       inserted bitstream filters are initialized with the correct time base.  */
+    for (n = 0; n < avctx->nb_streams; n++) {
+        AVStream *st = avctx->streams[n];
+        AVCodecParameters *c = st->codecpar;
+        if (c->codec_type == AVMEDIA_TYPE_DATA) {
+            if (decklink_setup_data(avctx, st))
+                goto error;
+        } else if (c->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            if (decklink_setup_subtitle(avctx, st))
+                goto error;
+        }
+    }
+
+    /* Now that video has been setup and the time_base has been set for any
+       data/subtitle streams, do the setup.  This ensures that any automatically
+       inserted bitstream filters are initialized with the correct time base.  */
+    for (n = 0; n < avctx->nb_streams; n++) {
+        AVStream *st = avctx->streams[n];
+        AVCodecParameters *c = st->codecpar;
+        if (c->codec_type == AVMEDIA_TYPE_DATA) {
+            if (decklink_setup_data(avctx, st))
+                goto error;
+        } else if (c->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            if (decklink_setup_subtitle(avctx, st))
+                goto error;
+        }
+    }
+
     ff_decklink_packet_queue_init(avctx, &ctx->vanc_queue, cctx->vanc_queue_size);
 
     ret = ff_ccfifo_init(&ctx->cc_fifo, av_make_q(ctx->bmd_tb_den, ctx->bmd_tb_num), avctx);
     if (ret < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failure to setup CC FIFO queue\n");
         goto error;
+    }
+
+    if (ctx->audio > 0) {
+        ctx->audio_st_lastpts = (int64_t *) av_malloc_array(avctx->nb_streams, sizeof(int64_t));
+        if (ctx->audio_st_lastpts == NULL)
+            goto error;
+        if (decklink_enable_audio(avctx))
+            goto error;
+
+        ctx->audio_st_offset = (int64_t *) av_malloc_array(avctx->nb_streams, sizeof(int64_t));
+        if (ctx->audio_st_offset == NULL)
+            goto error;
+    }
+
+    /* Configure Audio Delay parameters.  Note that the command line parameter
+       is specified in milliseconds but our internal offset is specified in
+       number of samples on the 48000 audio clock */
+    if (cctx->audio_delay_param) {
+        const char s[2] = ",";
+        char *token;
+        int count = 0, val;
+        int last_audio = 0;
+
+        /* get the first token */
+        token = strtok(cctx->audio_delay_param, s);
+
+        /* walk through other tokens */
+        while( token != NULL ) {
+            errno = 0;
+            val = strtol(token, NULL, 10);
+            if (errno == 0) {
+                /* Find the nth audio stream */
+                for (unsigned int n = last_audio; n < avctx->nb_streams; n++) {
+                    AVStream *st = avctx->streams[n];
+                    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                        ctx->audio_st_offset[n] = val * 48000 / 1000;
+                        last_audio = n + 1;
+                        break;
+                    }
+                }
+            }
+            token = strtok(NULL, s);
+            count++;
+        }
     }
 
     return 0;
@@ -938,17 +1541,27 @@ error:
 int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
     AVStream *st = avctx->streams[pkt->stream_index];
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    int ret = AVERROR(EIO);
+
+    if (cctx->debug_level >= 4)
+        av_log(avctx, AV_LOG_INFO, "%s called. Type=%s pts=%" PRId64 "\n", __func__,
+               av_get_media_type_string(st->codecpar->codec_type), pkt->pts);
 
     if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
-        return decklink_write_video_packet(avctx, pkt);
+        ret = decklink_write_video_packet(avctx, pkt);
     else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-        return decklink_write_audio_packet(avctx, pkt);
+        ret = decklink_write_audio_packet(avctx, pkt);
     else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
-        return decklink_write_data_packet(avctx, pkt);
+        ret = decklink_write_data_packet(avctx, pkt);
     else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
-        return decklink_write_subtitle_packet(avctx, pkt);
+        ret = decklink_write_subtitle_packet(avctx, pkt);
 
-    return AVERROR(EIO);
+    if (cctx->debug_level >= 4)
+        av_log(avctx, AV_LOG_INFO, "%s returning.  Type=%s\n", __func__,
+               av_get_media_type_string(st->codecpar->codec_type));
+
+    return ret;
 }
 
 int ff_decklink_list_output_devices(AVFormatContext *avctx, struct AVDeviceInfoList *device_list)

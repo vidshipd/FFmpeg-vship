@@ -48,6 +48,7 @@ extern "C" {
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/bswap.h"
+#include "libavutil/avstring.h"
 #include "avdevice.h"
 }
 
@@ -251,6 +252,18 @@ int ff_decklink_set_configs(AVFormatContext *avctx,
         }
     }
 
+    DECKLINK_BOOL hdr_supported;
+    if (ctx->attr->GetFlag(BMDDeckLinkSupportsHDRMetadata, &hdr_supported) == S_OK) {
+        if (hdr_supported)
+            ctx->supports_hdr = 1;
+    }
+
+    DECKLINK_BOOL colorspace_supported;
+    if (ctx->attr->GetFlag(BMDDeckLinkSupportsColorspaceMetadata, &colorspace_supported) == S_OK) {
+        if (colorspace_supported)
+            ctx->supports_colorspace = 1;
+    }
+
     return 0;
 }
 
@@ -301,6 +314,10 @@ int ff_decklink_set_format(AVFormatContext *avctx,
 
         mode->GetFrameRate(&bmd_tb_num, &bmd_tb_den);
         AVRational mode_tb = av_make_q(bmd_tb_num, bmd_tb_den);
+
+        av_log(avctx, AV_LOG_DEBUG, "Available Decklink mode %d x %d with rate %.2f%s\n",
+               bmd_width, bmd_height, 1/av_q2d(mode_tb),
+               (bmd_field_dominance==bmdLowerFieldFirst || bmd_field_dominance==bmdUpperFieldFirst)?"(i)":"");
 
         if ((bmd_width == width &&
              bmd_height == height &&
@@ -507,6 +524,7 @@ int ff_decklink_list_devices(AVFormatContext *avctx,
     IDeckLink *dl = NULL;
     IDeckLinkIterator *iter = decklink_create_iterator(avctx);
     int ret = 0;
+    int i = 0;
 
     if (!iter)
         return AVERROR(EIO);
@@ -546,8 +564,17 @@ int ff_decklink_list_devices(AVFormatContext *avctx,
                 ret = AVERROR(ENOMEM);
                 goto next;
             }
-
+#if 0
             new_device->device_name = av_strdup(unique_name ? unique_name : display_name);
+#else
+            /* use "decklink0" naming convention */
+            new_device->device_name = av_asprintf("decklink%d", i);
+            if (!new_device->device_name) {
+                ret = AVERROR(ENOMEM);
+                goto next;
+            }
+            i++;
+#endif
             new_device->device_description = av_strdup(display_name);
 
             if (!new_device->device_name ||
@@ -658,6 +685,8 @@ void ff_decklink_cleanup(AVFormatContext *avctx)
         ctx->attr->Release();
     if (ctx->cfg)
         ctx->cfg->Release();
+    if (ctx->status)
+        ctx->status->Release();
     if (ctx->dl)
         ctx->dl->Release();
 }
@@ -667,16 +696,24 @@ int ff_decklink_init_device(AVFormatContext *avctx, const char* name)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     IDeckLink *dl = NULL;
+    int i = 0;
+    int dev_no = -1;
     IDeckLinkIterator *iter = decklink_create_iterator(avctx);
     if (!iter)
         return AVERROR_EXTERNAL;
+
+    av_log(avctx, AV_LOG_VERBOSE, "Using BlackMagic SDK version %s\n",
+           BLACKMAGIC_DECKLINK_API_VERSION_STRING);
+
+    /* See if the name passed is a device name, or a device description */
+    sscanf(name, "decklink%d", &dev_no);
 
     while (iter->Next(&dl) == S_OK) {
         const char *display_name = NULL;
         const char *unique_name = NULL;
         decklink_get_attr_string(dl, BMDDeckLinkDisplayName, &display_name);
         decklink_get_attr_string(dl, BMDDeckLinkDeviceHandle, &unique_name);
-        if (display_name && !strcmp(name, display_name) || unique_name && !strcmp(name, unique_name)) {
+        if (dev_no == i || display_name && !strcmp(name, display_name) || unique_name && !strcmp(name, unique_name)) {
             av_free((void *)unique_name);
             av_free((void *)display_name);
             ctx->dl = dl;
@@ -685,6 +722,7 @@ int ff_decklink_init_device(AVFormatContext *avctx, const char* name)
         av_free((void *)display_name);
         av_free((void *)unique_name);
         dl->Release();
+        i++;
     }
     iter->Release();
     if (!ctx->dl)
@@ -698,6 +736,12 @@ int ff_decklink_init_device(AVFormatContext *avctx, const char* name)
 
     if (ctx->dl->QueryInterface(IID_IDeckLinkProfileAttributes, (void **)&ctx->attr) != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Could not get attributes interface for '%s'\n", name);
+        ff_decklink_cleanup(avctx);
+        return AVERROR_EXTERNAL;
+    }
+
+    if (ctx->dl->QueryInterface(IID_IDeckLinkStatus, (void **)&ctx->status) != S_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Could not get status interface for '%s'\n", name);
         ff_decklink_cleanup(avctx);
         return AVERROR_EXTERNAL;
     }
