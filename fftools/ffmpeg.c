@@ -504,6 +504,10 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     int64_t pts = AV_NOPTS_VALUE;
     static int64_t last_time = -1;
     static int first_report = 1;
+    static uint64_t last_frame_number = 0;
+    static int64_t last_report_time = -1;
+    static int64_t last_total_size = 0;
+    static int64_t last_pts = AV_NOPTS_VALUE;
     uint64_t nb_frames_dup = 0, nb_frames_drop = 0;
     int mins, secs, us;
     int64_t hours;
@@ -518,9 +522,11 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         if (last_time == -1) {
             last_time = cur_time;
         }
+        // Check if enough time has passed since the last report (for periodic updates)
         if (((cur_time - last_time) < stats_period && !first_report) ||
             (first_report && nb_output_dumped < nb_output_files))
             return;
+        // Update last_time for the next periodic check
         last_time = cur_time;
     }
 
@@ -529,6 +535,11 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     vid = 0;
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
     av_bprint_init(&buf_script, 0, AV_BPRINT_SIZE_AUTOMATIC);
+
+    uint64_t current_frame_number = 0; // To store the total frames processed for the primary video stream
+    double instantaneous_fps = 0.0;
+    int64_t time_since_last_report = 0;
+
     for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
         const float q = ost->enc ? ost->quality / (float) FF_QP2LAMBDA : -1;
 
@@ -537,15 +548,26 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
             av_bprintf(&buf_script, "stream_%d_%d_q=%.1f\n",
                        ost->file_index, ost->index, q);
         }
-        if (!vid && ost->type == AVMEDIA_TYPE_VIDEO && ost->filter) {
-            float fps;
-            uint64_t frame_number = atomic_load(&ost->packets_written);
 
-            fps = t > 1 ? frame_number / t : 0;
+        // Find the primary video stream to calculate FPS
+        if (!vid && ost->type == AVMEDIA_TYPE_VIDEO && ost->filter) {
+            current_frame_number = atomic_load(&ost->packets_written);
+
+            // Calculate instantaneous FPS
+            if (last_report_time != -1 && cur_time > last_report_time) {
+                 time_since_last_report = cur_time - last_report_time;
+                 uint64_t frames_since_last_report = current_frame_number - last_frame_number;
+                 instantaneous_fps = (double)frames_since_last_report * 1000000.0 / time_since_last_report;
+            } else if (last_report_time == -1 && t > 0) {
+                 // For the very first report, calculate FPS based on total time
+                 instantaneous_fps = current_frame_number / t;
+            }
+
+
             av_bprintf(&buf, "frame=%5"PRId64" fps=%3.*f q=%3.1f ",
-                     frame_number, fps < 9.95, fps, q);
-            av_bprintf(&buf_script, "frame=%"PRId64"\n", frame_number);
-            av_bprintf(&buf_script, "fps=%.2f\n", fps);
+                       current_frame_number, instantaneous_fps < 9.95 ? 2 : 1, instantaneous_fps, q); // Use instantaneous_fps here
+            av_bprintf(&buf_script, "frame=%"PRId64"\n", current_frame_number);
+            av_bprintf(&buf_script, "fps=%.2f\n", instantaneous_fps); // Use instantaneous_fps here
             av_bprintf(&buf_script, "stream_%d_%d_q=%.1f\n",
                        ost->file_index, ost->index, q);
             if (is_last_report)
@@ -554,7 +576,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
             nb_frames_dup  = ost->filter->nb_frames_dup;
             nb_frames_drop = ost->filter->nb_frames_drop;
 
-            vid = 1;
+            vid = 1; // Mark that we've found the primary video stream
         }
         /* compute min output value */
         if (ost->last_mux_dts != AV_NOPTS_VALUE) {
@@ -569,13 +591,35 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         }
     }
 
-    us    = FFABS64U(pts) % AV_TIME_BASE;
-    secs  = FFABS64U(pts) / AV_TIME_BASE % 60;
-    mins  = FFABS64U(pts) / AV_TIME_BASE / 60 % 60;
+    // Calculate instantaneous bitrate
+    double instantaneous_bitrate = -1;
+    if (total_size >= 0 && pts != AV_NOPTS_VALUE && last_total_size != -1 && last_pts != AV_NOPTS_VALUE && pts > last_pts) {
+        int64_t size_since_last_report = total_size - last_total_size;
+        int64_t pts_since_last_report = pts - last_pts;
+        if (pts_since_last_report > 0) {
+            instantaneous_bitrate = (double)size_since_last_report * 8 * AV_TIME_BASE / pts_since_last_report / 1000.0;
+        }
+    } else if (total_size >= 0 && pts != AV_NOPTS_VALUE && pts > 0 && t > 0) {
+         // For the very first report or if previous values are invalid, calculate based on total values
+        instantaneous_bitrate = (double)total_size * 8 / (pts / (double)AV_TIME_BASE) / 1000.0;
+    }
+
+
+    // Update static variables for the next report
+    last_frame_number = current_frame_number;
+    last_report_time = cur_time;
+    last_total_size = total_size;
+    last_pts = pts;
+
+
+    us      = FFABS64U(pts) % AV_TIME_BASE;
+    secs    = FFABS64U(pts) / AV_TIME_BASE % 60;
+    mins    = FFABS64U(pts) / AV_TIME_BASE / 60 % 60;
     hours = FFABS64U(pts) / AV_TIME_BASE / 3600;
     hours_sign = (pts < 0) ? "-" : "";
 
-    bitrate = pts != AV_NOPTS_VALUE && pts && total_size >= 0 ? total_size * 8 / (pts / 1000.0) : -1;
+    // The original bitrate calculation is no longer used for the printed report
+    // bitrate = pts != AV_NOPTS_VALUE && pts && total_size >= 0 ? total_size * 8 / (pts / 1000.0) : -1;
     speed   = pts != AV_NOPTS_VALUE && t != 0.0 ? (double)pts / AV_TIME_BASE / t : -1;
 
     if (total_size < 0) av_bprintf(&buf, "size=N/A time=");
@@ -587,12 +631,12 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
                    hours_sign, hours, mins, secs, (100 * us) / AV_TIME_BASE);
     }
 
-    if (bitrate < 0) {
+    if (instantaneous_bitrate < 0) { // Use instantaneous_bitrate here
         av_bprintf(&buf, "bitrate=N/A");
         av_bprintf(&buf_script, "bitrate=N/A\n");
     }else{
-        av_bprintf(&buf, "bitrate=%6.1fkbits/s", bitrate);
-        av_bprintf(&buf_script, "bitrate=%6.1fkbits/s\n", bitrate);
+        av_bprintf(&buf, "bitrate=%6.1fkbits/s", instantaneous_bitrate); // Use instantaneous_bitrate here
+        av_bprintf(&buf_script, "bitrate=%6.1fkbits/s\n", instantaneous_bitrate); // Use instantaneous_bitrate here
     }
 
     if (total_size < 0) av_bprintf(&buf_script, "total_size=N/A\n");
@@ -624,9 +668,9 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     if (print_stats || is_last_report) {
         const char end = is_last_report ? '\n' : '\r';
         if (print_stats==1 && AV_LOG_INFO > av_log_get_level()) {
-            fprintf(stderr, "%s    %c", buf.str, end);
+            fprintf(stderr, "%s     %c", buf.str, end);
         } else
-            av_log(NULL, AV_LOG_INFO, "%s    %c", buf.str, end);
+            av_log(NULL, AV_LOG_INFO, "%s     %c", buf.str, end);
 
         fflush(stderr);
     }

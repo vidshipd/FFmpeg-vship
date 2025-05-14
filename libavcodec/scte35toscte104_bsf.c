@@ -53,7 +53,7 @@ static int scte35toscte104_filter(AVBSFContext *ctx, AVPacket *out)
         return -1;
     }
     orig_pts = av_rescale_q(transport_ts->pts, transport_ts->time_base, (AVRational){1, 90000});
-    av_log(ctx, AV_LOG_DEBUG, "pts=%" PRId64 " orig_pts=%" PRId64 "\n", in->pts, orig_pts);
+    av_log(ctx, AV_LOG_INFO, "pts=%" PRId64 " orig_pts=%" PRId64 "\n", in->pts, orig_pts);
 
     /* Parse the SCTE-35 packet */
     s = scte35_splice_info_section_parse(in->data, in->size);

@@ -55,6 +55,8 @@ typedef struct SRTContext {
     int eid;
     int64_t rw_timeout;
     int64_t listen_timeout;
+    int64_t lastStatsTime;
+    int64_t stats;
     int recv_buffer_size;
     int send_buffer_size;
 
@@ -99,6 +101,7 @@ typedef struct SRTContext {
 static const AVOption libsrt_options[] = {
     { "timeout",        "Timeout of socket I/O operations (in microseconds)",                   OFFSET(rw_timeout),       AV_OPT_TYPE_INT64, { .i64 = -1 }, -1, INT64_MAX, .flags = D|E },
     { "listen_timeout", "Connection awaiting timeout (in microseconds)" ,                       OFFSET(listen_timeout),   AV_OPT_TYPE_INT64, { .i64 = -1 }, -1, INT64_MAX, .flags = D|E },
+    { "stats",          "Show SRT statistics in the log output",                                OFFSET(stats),            AV_OPT_TYPE_INT64, { .i64 = -1 }, -1, INT64_MAX, .flags = D|E },
     { "send_buffer_size", "Socket send buffer size (in bytes)",                                 OFFSET(send_buffer_size), AV_OPT_TYPE_INT,      { .i64 = -1 }, -1, INT_MAX,   .flags = D|E },
     { "recv_buffer_size", "Socket receive buffer size (in bytes)",                              OFFSET(recv_buffer_size), AV_OPT_TYPE_INT,      { .i64 = -1 }, -1, INT_MAX,   .flags = D|E },
     { "pkt_size",       "Maximum SRT packet size",                                              OFFSET(payload_size),     AV_OPT_TYPE_INT,      { .i64 = -1 }, -1, SRT_LIVE_MAX_PAYLOAD_SIZE, .flags = D|E, "payload_size" },
@@ -146,6 +149,42 @@ static const AVOption libsrt_options[] = {
     { "tsbpd",          "Timestamp-based packet delivery",                                      OFFSET(tsbpd),            AV_OPT_TYPE_BOOL,     { .i64 = -1 }, -1, 1,         .flags = D|E },
     { NULL }
 };
+
+static int libsrt_stats(URLContext *h, int read)
+{   
+    SRTContext *s = h->priv_data;
+
+    int64_t timeNow = av_gettime_relative() / 1000;
+
+    if (timeNow > s->lastStatsTime + s->stats) {
+        SRT_TRACEBSTATS trace;
+        int ret = srt_bstats(s->fd, &trace, 1);
+        s->lastStatsTime = timeNow;
+
+        if (ret < 0) return 0;
+
+        if (read > 0) {
+            av_log(h, AV_LOG_INFO, "[stats] mbpsSendRate=%.2f mbpsBandwidth=%.2f msRTT=%.2f pktRecv=%d pktRcvRetrans=%d pktRcvLoss=%d \n", 
+                  trace.mbpsRecvRate,
+                  trace.mbpsBandwidth,
+                  trace.msRTT,
+                  trace.pktRecv,
+                  trace.pktRcvRetrans,
+                  trace.pktRcvLoss);
+        }
+        else{
+            av_log(h, AV_LOG_INFO, "[stats] mbpsSendRate=%.2f mbpsBandwidth=%.2f msRTT=%.2f pktSent=%d pktRetrans=%d pktSndLoss=%d \n", 
+                  trace.mbpsSendRate,
+                  trace.mbpsBandwidth,
+                  trace.msRTT,
+                  trace.pktSent,
+                  trace.pktRetrans,
+                  trace.pktSndLoss);
+        }
+    }
+
+    return 0;
+}
 
 static int libsrt_neterrno(URLContext *h)
 {
@@ -240,6 +279,8 @@ static int libsrt_listen(int eid, int fd, const struct sockaddr *addr, socklen_t
     /* Max streamid length plus an extra space for the terminating null character */
     char streamid[513];
     int streamid_len = sizeof(streamid);
+    int latency = 0;
+    int latency_len = sizeof(latency);
     if (srt_setsockopt(fd, SOL_SOCKET, SRTO_REUSEADDR, &reuse, sizeof(reuse))) {
         av_log(h, AV_LOG_WARNING, "setsockopt(SRTO_REUSEADDR) failed\n");
     }
@@ -262,12 +303,18 @@ static int libsrt_listen(int eid, int fd, const struct sockaddr *addr, socklen_t
         /* Note: returned streamid_len doesn't count the terminating null character */
         av_log(h, AV_LOG_VERBOSE, "accept streamid [%s], length %d\n", streamid, streamid_len);
 
+    // Get and output the agreed upon latency
+    if (!libsrt_getsockopt(h, ret, SRTO_LATENCY, "SRTO_LATENCY", &latency, &latency_len))
+        av_log(h, AV_LOG_INFO, "SRT connection established with latency: %d ms\n", latency);
+
     return ret;
 }
 
 static int libsrt_listen_connect(int eid, int fd, const struct sockaddr *addr, socklen_t addrlen, int64_t timeout, URLContext *h, int will_try_next)
 {
     int ret;
+    int latency = 0;
+    int latency_len = sizeof(latency);
 
     if (srt_connect(fd, addr, addrlen) < 0)
         return libsrt_neterrno(h);
@@ -282,6 +329,10 @@ static int libsrt_listen_connect(int eid, int fd, const struct sockaddr *addr, s
             av_log(h, AV_LOG_ERROR, "Connection to %s failed: %s\n",
                    h->filename, av_err2str(ret));
         }
+    } else {
+        // Get and output the agreed upon latency
+        if (!libsrt_getsockopt(h, fd, SRTO_LATENCY, "SRTO_LATENCY", &latency, &latency_len))
+            av_log(h, AV_LOG_INFO, "SRT connection established with latency: %d ms\n", latency);
     }
     return ret;
 }
@@ -542,6 +593,9 @@ static int libsrt_open(URLContext *h, const char *uri, int flags)
     /* SRT options (srt/srt.h) */
     p = strchr(uri, '?');
     if (p) {
+        if (av_find_info_tag(buf, sizeof(buf), "stats", p)) {
+            s->stats = strtol(buf, NULL, 10);
+        }
         if (av_find_info_tag(buf, sizeof(buf), "maxbw", p)) {
             s->maxbw = strtoll(buf, NULL, 10);
         }
@@ -683,6 +737,10 @@ static int libsrt_read(URLContext *h, uint8_t *buf, int size)
     SRTContext *s = h->priv_data;
     int ret;
 
+    if(s->stats > 0) {
+        libsrt_stats(h,1);
+    }
+
     if (!(h->flags & AVIO_FLAG_NONBLOCK)) {
         ret = libsrt_network_wait_fd_timeout(h, s->eid, 0, h->rw_timeout, &h->interrupt_callback);
         if (ret)
@@ -701,6 +759,10 @@ static int libsrt_write(URLContext *h, const uint8_t *buf, int size)
 {
     SRTContext *s = h->priv_data;
     int ret;
+
+    if(s->stats > 0) {
+        libsrt_stats(h,0);
+    }
 
     if (!(h->flags & AVIO_FLAG_NONBLOCK)) {
         ret = libsrt_network_wait_fd_timeout(h, s->eid, 1, h->rw_timeout, &h->interrupt_callback);

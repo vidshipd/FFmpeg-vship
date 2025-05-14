@@ -62,7 +62,7 @@ static int scte35ptsadjust_filter(AVBSFContext *ctx, AVPacket *pkt)
     cur_pts_adjust = ((int64_t)(pkt->data[4] & 1) << 32 ) |
 	    AV_RB32(pkt->data + 5);
 
-    av_log(ctx, AV_LOG_DEBUG, "pts=%" PRId64 "(%d/%d) orig_pts=%" PRId64 "(%d/%d) pts_adjust=%" PRId64 "\n",
+    av_log(ctx, AV_LOG_ERROR, "pts=%" PRId64 "(%d/%d) orig_pts=%" PRId64 "(%d/%d) pts_adjust=%" PRId64 "\n",
            pkt->pts, pkt->time_base.num, pkt->time_base.den,
            transport_ts->pts, transport_ts->time_base.num, transport_ts->time_base.den, cur_pts_adjust);
 
@@ -71,7 +71,7 @@ static int scte35ptsadjust_filter(AVBSFContext *ctx, AVPacket *pkt)
     cur_pts_adjust += av_rescale_q(pkt->pts, pkt->time_base, (AVRational){1, 90000});
     cur_pts_adjust &= 0x1FFFFFFFFLL;
 
-    av_log(ctx, AV_LOG_DEBUG, "new pts_adjust=%" PRId64 "\n", cur_pts_adjust);
+    av_log(ctx, AV_LOG_ERROR, "new pts_adjust=%" PRId64 "\n", cur_pts_adjust);
 
     ret = av_packet_make_writable(pkt);
     if (ret < 0)
