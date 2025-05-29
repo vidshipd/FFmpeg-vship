@@ -115,30 +115,41 @@ typedef struct UDPContext {
     char *sources;
     char *block;
     IPSourceFilters filters;
+
+    // --- ADDED FOR INTER-PACKET DELAY ---
+    int64_t last_send_time;
+    int inter_packet_delay_us;
+    // --- END ADDED ---
+
 } UDPContext;
 
 #define OFFSET(x) offsetof(UDPContext, x)
 #define D AV_OPT_FLAG_DECODING_PARAM
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "buffer_size",    "System data size (in bytes)",                     OFFSET(buffer_size),    AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, .flags = D|E },
-    { "bitrate",        "Bits to send per second",                         OFFSET(bitrate),        AV_OPT_TYPE_INT64,  { .i64 = 0  },     0, INT64_MAX, .flags = E },
-    { "burst_bits",     "Max length of bursts in bits (when using bitrate)", OFFSET(burst_bits),   AV_OPT_TYPE_INT64,  { .i64 = 0  },     0, INT64_MAX, .flags = E },
-    { "localport",      "Local port",                                      OFFSET(local_port),     AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, D|E },
-    { "local_port",     "Local port",                                      OFFSET(local_port),     AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, .flags = D|E },
-    { "localaddr",      "Local address",                                   OFFSET(localaddr),      AV_OPT_TYPE_STRING, { .str = NULL },               .flags = D|E },
+    { "buffer_size",      "System data size (in bytes)",                       OFFSET(buffer_size),      AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, .flags = D|E },
+    { "bitrate",          "Bits to send per second",                           OFFSET(bitrate),          AV_OPT_TYPE_INT64,  { .i64 = 0  },     0, INT64_MAX, .flags = E },
+    { "burst_bits",       "Max length of bursts in bits (when using bitrate)", OFFSET(burst_bits),     AV_OPT_TYPE_INT64,  { .i64 = 0  },     0, INT64_MAX, .flags = E },
+    { "localport",        "Local port",                                        OFFSET(local_port),       AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, D|E },
+    { "local_port",       "Local port",                                        OFFSET(local_port),       AV_OPT_TYPE_INT,    { .i64 = -1 },    -1, INT_MAX, .flags = D|E },
+    { "localaddr",        "Local address",                                     OFFSET(localaddr),        AV_OPT_TYPE_STRING, { .str = NULL },          .flags = D|E },
     { "udplite_coverage", "choose UDPLite head size which should be validated by checksum", OFFSET(udplite_coverage), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, D|E },
-    { "pkt_size",       "Maximum UDP packet size",                         OFFSET(pkt_size),       AV_OPT_TYPE_INT,    { .i64 = 1472 },  -1, INT_MAX, .flags = D|E },
-    { "reuse",          "explicitly allow reusing UDP sockets",            OFFSET(reuse_socket),   AV_OPT_TYPE_BOOL,   { .i64 = -1 },    -1, 1,       D|E },
-    { "reuse_socket",   "explicitly allow reusing UDP sockets",            OFFSET(reuse_socket),   AV_OPT_TYPE_BOOL,   { .i64 = -1 },    -1, 1,       .flags = D|E },
-    { "broadcast", "explicitly allow or disallow broadcast destination",   OFFSET(is_broadcast),   AV_OPT_TYPE_BOOL,   { .i64 = 0  },     0, 1,       E },
-    { "ttl",            "Time to live (multicast only)",                   OFFSET(ttl),            AV_OPT_TYPE_INT,    { .i64 = 16 },     0, 255,     E },
-    { "connect",        "set if connect() should be called on socket",     OFFSET(is_connected),   AV_OPT_TYPE_BOOL,   { .i64 =  0 },     0, 1,       .flags = D|E },
-    { "fifo_size",      "set the UDP receiving circular buffer size, expressed as a number of packets with size of 188 bytes", OFFSET(circular_buffer_size), AV_OPT_TYPE_INT, {.i64 = 7*4096}, 0, INT_MAX, D },
+    { "pkt_size",         "Maximum UDP packet size",                           OFFSET(pkt_size),         AV_OPT_TYPE_INT,    { .i64 = 1472 },  -1, INT_MAX, .flags = D|E },
+    { "reuse",            "explicitly allow reusing UDP sockets",              OFFSET(reuse_socket),     AV_OPT_TYPE_BOOL,   { .i64 = -1 },    -1, 1,         D|E },
+    { "reuse_socket",     "explicitly allow reusing UDP sockets",              OFFSET(reuse_socket),     AV_OPT_TYPE_BOOL,   { .i64 = -1 },    -1, 1,         .flags = D|E },
+    { "broadcast", "explicitly allow or disallow broadcast destination",  OFFSET(is_broadcast),   AV_OPT_TYPE_BOOL,   { .i64 = 0  },     0, 1,         E },
+    { "ttl",              "Time to live (multicast only)",                     OFFSET(ttl),              AV_OPT_TYPE_INT,    { .i64 = 16 },     0, 255,       E },
+    { "connect",          "set if connect() should be called on socket",       OFFSET(is_connected),   AV_OPT_TYPE_BOOL,   { .i64 =  0 },     0, 1,         .flags = D|E },
+    { "fifo_size",        "set the UDP receiving circular buffer size, expressed as a number of packets with size of 188 bytes", OFFSET(circular_buffer_size), AV_OPT_TYPE_INT, {.i64 = 7*4096}, 0, INT_MAX, D },
     { "overrun_nonfatal", "survive in case of UDP receiving circular buffer overrun", OFFSET(overrun_nonfatal), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1,    D },
-    { "timeout",        "set raise error timeout, in microseconds (only in read mode)",OFFSET(timeout),         AV_OPT_TYPE_INT,  {.i64 = 0}, 0, INT_MAX, D },
-    { "sources",        "Source list",                                     OFFSET(sources),        AV_OPT_TYPE_STRING, { .str = NULL },               .flags = D|E },
-    { "block",          "Block list",                                      OFFSET(block),          AV_OPT_TYPE_STRING, { .str = NULL },               .flags = D|E },
+    { "timeout",          "set raise error timeout, in microseconds (only in read mode)",OFFSET(timeout),        AV_OPT_TYPE_INT,  {.i64 = 0}, 0, INT_MAX, D },
+    { "sources",          "Source list",                                       OFFSET(sources),          AV_OPT_TYPE_STRING, { .str = NULL },          .flags = D|E },
+    { "block",            "Block list",                                        OFFSET(block),            AV_OPT_TYPE_STRING, { .str = NULL },          .flags = D|E },
+
+    // --- ADDED FOR INTER-PACKET DELAY ---
+    { "inter_packet_delay", "Minimum delay between packets in microseconds (output, 0 to disable, not used if bitrate is set)", OFFSET(inter_packet_delay_us), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, .flags = E },
+    // --- END ADDED ---
+
     { NULL }
 };
 
@@ -605,6 +616,15 @@ static void *circular_buffer_task_tx( void *_URLContext)
             }
             sent_bits += len * 8;
             target_timestamp = start_timestamp + sent_bits * 1000000 / s->bitrate;
+        } else if (s->inter_packet_delay_us) {
+            timestamp = av_gettime_relative();
+            if (timestamp < target_timestamp) {
+                target_timestamp = FFMIN(target_timestamp, timestamp + s->inter_packet_delay_us);
+                av_usleep(target_timestamp - timestamp);
+            } else {
+                target_timestamp = timestamp;
+            }
+            target_timestamp += s->inter_packet_delay_us;
         }
 
         p = s->tmp;
@@ -655,6 +675,10 @@ static int udp_open(URLContext *h, const char *uri, int flags)
     struct sockaddr_storage my_addr;
     socklen_t len;
     int ret;
+
+    // --- ADDED FOR INTER-PACKET DELAY ---
+    s->last_send_time = 0;
+    // --- END ADDED ---
 
     h->is_streamed = 1;
 
@@ -724,6 +748,9 @@ static int udp_open(URLContext *h, const char *uri, int flags)
                 av_log(h, AV_LOG_WARNING,
                        "'circular_buffer_size' option was set but it is not supported "
                        "on this build (pthread support is required)\n");
+        }
+        if (av_find_info_tag(buf, sizeof(buf), "inter_packet_delay", p)) {
+            s->inter_packet_delay_us = strtol(buf, NULL, 10);
         }
         if (av_find_info_tag(buf, sizeof(buf), "bitrate", p)) {
             s->bitrate = strtoll(buf, NULL, 10);
@@ -933,7 +960,12 @@ static int udp_open(URLContext *h, const char *uri, int flags)
         av_log(h, AV_LOG_WARNING,"'bitrate' option was set but 'circular_buffer_size' is not, but required\n");
     }
 
-    if ((!is_output && s->circular_buffer_size) || (is_output && s->bitrate && s->circular_buffer_size)) {
+    if (is_output && s->inter_packet_delay_us && !s->circular_buffer_size) {
+        /* Warn user in case of 'circular_buffer_size' is not set */
+        av_log(h, AV_LOG_WARNING,"'inter_packet_delay_us' option was set but 'circular_buffer_size' is not, but required\n");
+    }
+
+    if ((!is_output && s->circular_buffer_size) || (is_output && (s->bitrate || s->inter_packet_delay_us) && s->circular_buffer_size)) {
         /* start the task going */
         s->fifo = av_fifo_alloc2(s->circular_buffer_size, 1, 0);
         if (!s->fifo) {
@@ -1057,15 +1089,11 @@ static int udp_write(URLContext *h, const uint8_t *buf, int size)
     int ret;
 
 #if HAVE_PTHREAD_CANCEL
-    if (s->fifo) {
-        uint8_t tmp[4];
+    if (s->fifo) { // If fifo is used, bitrate-based pacing is active in circular_buffer_task_tx
+        uint8_t tmp_hdr[4]; // Renamed to avoid conflict with s->tmp
 
         pthread_mutex_lock(&s->mutex);
 
-        /*
-          Return error if last tx failed.
-          Here we can't know on which packet error was, but it needs to know that error exists.
-        */
         if (s->circular_buffer_error<0) {
             int err = s->circular_buffer_error;
             pthread_mutex_unlock(&s->mutex);
@@ -1073,18 +1101,18 @@ static int udp_write(URLContext *h, const uint8_t *buf, int size)
         }
 
         if (av_fifo_can_write(s->fifo) < size + 4) {
-            /* What about a partial packet tx ? */
             pthread_mutex_unlock(&s->mutex);
             return AVERROR(ENOMEM);
         }
-        AV_WL32(tmp, size);
-        av_fifo_write(s->fifo, tmp, 4); /* size of packet */
+        AV_WL32(tmp_hdr, size);
+        av_fifo_write(s->fifo, tmp_hdr, 4); /* size of packet */
         av_fifo_write(s->fifo, buf, size); /* the data */
         pthread_cond_signal(&s->cond);
         pthread_mutex_unlock(&s->mutex);
         return size;
     }
 #endif
+
     if (!(h->flags & AVIO_FLAG_NONBLOCK)) {
         ret = ff_network_wait_fd(s->udp_fd, 1);
         if (ret < 0)

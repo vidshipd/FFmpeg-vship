@@ -83,15 +83,60 @@ int av_gettime_relative_is_monotonic(void)
 
 int av_usleep(unsigned usec)
 {
-#if HAVE_NANOSLEEP
+#if _WIN32
+    // Use high-resolution timer for all sleep durations on Windows
+    LARGE_INTEGER t;
+    t.QuadPart = -(10 * (LONGLONG)usec); // Convert microseconds to 100-nanosecond intervals (negative for relative time)
+    
+    HANDLE timer = NULL;
+    
+    // Try to create high-resolution timer first (Windows 10 version 1803+)
+    // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002
+    #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+    #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+    #endif
+    
+    timer = CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    
+    // Fall back to regular waitable timer if high-resolution isn't available
+    if (!timer) {
+        timer = CreateWaitableTimer(NULL, TRUE, NULL);
+    }
+    
+    if (!timer) {
+        // Final fallback to Sleep() for very short durations or if timer creation fails
+        if (usec >= 1000) {
+            Sleep((usec + 500) / 1000); // Round to nearest millisecond
+        } else {
+            // For sub-millisecond delays, use busy wait with QueryPerformanceCounter
+            LARGE_INTEGER freq, start, current;
+            if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&start)) {
+                LONGLONG target_ticks = (LONGLONG)usec * freq.QuadPart / 1000000;
+                do {
+                    QueryPerformanceCounter(&current);
+                } while ((current.QuadPart - start.QuadPart) < target_ticks);
+            }
+        }
+        return 0;
+    }
+    
+    if (SetWaitableTimer(timer, &t, 0, NULL, NULL, 0)) {
+        WaitForSingleObject(timer, INFINITE);
+    } else {
+        // If SetWaitableTimer fails, fall back to Sleep
+        if (usec >= 1000) {
+            Sleep((usec + 500) / 1000);
+        }
+    }
+    
+    CloseHandle(timer);
+    return 0;
+#elif HAVE_NANOSLEEP
     struct timespec ts = { usec / 1000000, usec % 1000000 * 1000 };
     while (nanosleep(&ts, &ts) < 0 && errno == EINTR);
     return 0;
 #elif HAVE_USLEEP
     return usleep(usec);
-#elif HAVE_SLEEP
-    Sleep(usec / 1000);
-    return 0;
 #else
     return AVERROR(ENOSYS);
 #endif
