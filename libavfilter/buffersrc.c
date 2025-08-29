@@ -70,6 +70,7 @@ typedef struct BufferSourceContext {
         av_log(s, AV_LOG_INFO, "filter context - w: %d h: %d fmt: %d, incoming frame - w: %d h: %d fmt: %d pts_time: %s\n",\
                c->w, c->h, c->pix_fmt, width, height, format, av_ts2timestr(pts, &s->outputs[0]->time_base));\
         av_log(s, AV_LOG_WARNING, "Changing video frame properties on the fly is not supported by all filters.\n");\
+        return AVERROR(EINVAL);\
     }
 
 #define CHECK_AUDIO_PARAM_CHANGE(s, c, srate, layout, format, pts)\
