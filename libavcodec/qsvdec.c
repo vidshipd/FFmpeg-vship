@@ -757,7 +757,9 @@ static int qsv_decode(AVCodecContext *avctx, QSVContext *q,
     if (!*sync && !bs.DataOffset) {
         bs.DataOffset = avpkt->size;
         ++q->zero_consume_run;
-        if (q->zero_consume_run > 1)
+        if (q->zero_consume_run > 1 &&
+            (avpkt->size ||
+            ret != MFX_ERR_MORE_DATA))
             ff_qsv_print_warning(avctx, ret, "A decode call did not consume any data");
     } else {
         q->zero_consume_run = 0;
@@ -920,7 +922,7 @@ static int qsv_process_data(AVCodecContext *avctx, QSVContext *q,
         ret = qsv_decode_header(avctx, q, pkt, pix_fmt, &param);
         if (ret < 0) {
             if (ret == AVERROR(EAGAIN))
-                av_log(avctx, AV_LOG_INFO, "More data is required to decode header\n");
+                av_log(avctx, AV_LOG_VERBOSE, "More data is required to decode header\n");
             else
                 av_log(avctx, AV_LOG_ERROR, "Error decoding header\n");
             goto reinit_fail;
