@@ -23,6 +23,9 @@
 
 #include <srt/srt.h>
 
+#include "libavutil/avassert.h"
+#include "libavutil/fifo.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/time.h"
@@ -111,6 +114,19 @@ typedef struct SRTContext {
   SRTClient clients[MAX_CLIENTS];
   int num_clients;
   int max_connections;
+
+  /* --- Additions for Bitrate Pacing --- */
+  int64_t bitrate;
+  int64_t burst_bits;
+  int circular_buffer_size;
+  AVFifo *fifo;
+  int circular_buffer_error;
+  int close_req;
+  pthread_t circular_buffer_thread;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  int thread_started;
+  uint8_t tmp[SRT_LIVE_MAX_PAYLOAD_SIZE + 4];
 } SRTContext;
 
 #define D AV_OPT_FLAG_DECODING_PARAM
@@ -166,6 +182,9 @@ static const AVOption libsrt_options[] = {
   { "linger",         "Number of seconds that the socket waits for unsent data when closing", OFFSET(linger),           AV_OPT_TYPE_INT,      { .i64 = -1 }, -1, INT_MAX,   .flags = D|E },
   { "tsbpd",          "Timestamp-based packet delivery",                                      OFFSET(tsbpd),            AV_OPT_TYPE_BOOL,     { .i64 = -1 }, -1, 1,         .flags = D|E },
   { "max_connections", "Maximum number of connections in listener mode (output only)",        OFFSET(max_connections),  AV_OPT_TYPE_INT,      { .i64 = 1 },   1, MAX_CLIENTS, .flags = E },
+  { "bitrate",         "Bits to send per second",                                             OFFSET(bitrate),          AV_OPT_TYPE_INT64,    { .i64 = 0  },  0, INT64_MAX, .flags = E },
+  { "burst_bits",      "Max length of bursts in bits (when using bitrate)",                   OFFSET(burst_bits),       AV_OPT_TYPE_INT64,    { .i64 = 0  },  0, INT64_MAX, .flags = E },
+  { "fifo_size",       "set the SRT sending circular buffer size (in 188-byte packets)",      OFFSET(circular_buffer_size), AV_OPT_TYPE_INT,  { .i64 = 7*4096 }, 0, INT_MAX, .flags = E },
   { NULL }
 };
 
@@ -180,7 +199,28 @@ static int libsrt_stats(URLContext *h, int read)
   
   if (timeNow > s->lastStatsTime + s->stats) {
     SRT_TRACEBSTATS trace;
-    int ret = srt_bstats(s->fd, &trace, 1);
+    int stat_fd = s->fd;
+    int ret;
+
+    /* If in listener mode for output (multi-client), get the first active client's fd */
+    if (s->mode == SRT_MODE_LISTENER && s->is_output) {
+      int i;
+      pthread_mutex_lock(&s->clients_mutex);
+      for (i = 0; i < MAX_CLIENTS; i++) {
+        if (s->clients[i].active) {
+          stat_fd = s->clients[i].fd;
+          break;
+        }
+      }
+      pthread_mutex_unlock(&s->clients_mutex);
+      
+      /* If no clients are connected yet, skip pulling stats for the listener socket */
+      if (stat_fd == s->fd) {
+        return 0; 
+      }
+    }
+
+    ret = srt_bstats(stat_fd, &trace, 1);
     s->lastStatsTime = timeNow;
     
     if (ret < 0) return 0;
@@ -193,20 +233,19 @@ static int libsrt_stats(URLContext *h, int read)
         trace.pktRecv,
         trace.pktRcvRetrans,
         trace.pktRcvLoss);
-      }
-      else{
-        av_log(h, AV_LOG_INFO, "[stats] mbpsSendRate=%.2f mbpsBandwidth=%.2f msRTT=%.2f pktSent=%d pktRetrans=%d pktSndLoss=%d \n", 
-          trace.mbpsSendRate,
-          trace.mbpsBandwidth,
-          trace.msRTT,
-          trace.pktSent,
-          trace.pktRetrans,
-          trace.pktSndLoss);
-        }
-      }
-      
-      return 0;
+    } else {
+      av_log(h, AV_LOG_INFO, "[stats] mbpsSendRate=%.2f mbpsBandwidth=%.2f msRTT=%.2f pktSent=%d pktRetrans=%d pktSndLoss=%d \n", 
+        trace.mbpsSendRate,
+        trace.mbpsBandwidth,
+        trace.msRTT,
+        trace.pktSent,
+        trace.pktRetrans,
+        trace.pktSndLoss);
     }
+  }
+  
+  return 0;
+}
     
     static int libsrt_neterrno(URLContext *h)
     {
@@ -216,6 +255,97 @@ static int libsrt_stats(URLContext *h, int read)
       return AVERROR(EAGAIN);
       av_log(h, AV_LOG_ERROR, "%s\n", srt_getlasterror_str());
       return os_errno ? AVERROR(os_errno) : AVERROR_UNKNOWN;
+    }
+
+    static void *circular_buffer_task_tx(void *_URLContext)
+    {
+        URLContext *h = _URLContext;
+        SRTContext *s = h->priv_data;
+        int64_t target_timestamp = av_gettime_relative();
+        int64_t start_timestamp = av_gettime_relative();
+        int64_t sent_bits = 0;
+        int64_t burst_interval = s->bitrate ? (s->burst_bits * 1000000 / s->bitrate) : 0;
+        int64_t max_delay = s->bitrate ? ((int64_t)h->max_packet_size * 8 * 1000000 / s->bitrate + 1) : 0;
+
+        ff_thread_setname("srt-tx");
+
+        pthread_mutex_lock(&s->mutex);
+
+        for (;;) {
+            int len;
+            uint8_t tmp_hdr[4];
+            int64_t timestamp;
+
+            while (av_fifo_can_read(s->fifo) < 4) {
+                if (s->close_req)
+                    goto end;
+                pthread_cond_wait(&s->cond, &s->mutex);
+            }
+
+            av_fifo_read(s->fifo, tmp_hdr, 4);
+            len = AV_RL32(tmp_hdr);
+
+            av_assert0(len >= 0);
+            av_assert0(len <= sizeof(s->tmp) - 4);
+
+            av_fifo_read(s->fifo, s->tmp, len);
+
+            pthread_mutex_unlock(&s->mutex);
+
+            if (s->bitrate) {
+                timestamp = av_gettime_relative();
+                if (timestamp < target_timestamp) {
+                    int64_t delay = target_timestamp - timestamp;
+                    if (delay > max_delay) {
+                        delay = max_delay;
+                        start_timestamp = timestamp + delay;
+                        sent_bits = 0;
+                    }
+                    av_usleep(delay);
+                } else {
+                    if (timestamp - burst_interval > target_timestamp) {
+                        start_timestamp = timestamp - burst_interval;
+                        sent_bits = 0;
+                    }
+                }
+                sent_bits += len * 8;
+                target_timestamp = start_timestamp + sent_bits * 1000000 / s->bitrate;
+            }
+
+            /* Write packet (handles multi-client outputs as well as single connections) */
+            if (s->mode == SRT_MODE_LISTENER && s->is_output) {
+                int i;
+                pthread_mutex_lock(&s->clients_mutex);
+                for (i = 0; i < MAX_CLIENTS; i++) {
+                    if (s->clients[i].active) {
+                        int ret = srt_sendmsg(s->clients[i].fd, s->tmp, len, -1, 1);
+                        if (ret < 0) {
+                            int err = srt_getlasterror(NULL);
+                            if (err == SRT_ECONNLOST || err == SRT_ENOCONN) {
+                                s->clients[i].active = 0;
+                                s->num_clients--;
+                                srt_close(s->clients[i].fd);
+                            }
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&s->clients_mutex);
+            } else {
+                int ret = srt_sendmsg(s->fd, s->tmp, len, -1, 1);
+                if (ret < 0) {
+                    pthread_mutex_lock(&s->mutex);
+                    s->circular_buffer_error = libsrt_neterrno(h);
+                    pthread_mutex_unlock(&s->mutex);
+                    return NULL;
+                }
+            }
+
+            pthread_mutex_lock(&s->mutex);
+        }
+
+    end:
+        pthread_mutex_unlock(&s->mutex);
+        return NULL;
     }
     
     static int libsrt_getsockopt(URLContext *h, int fd, SRT_SOCKOPT optname, const char * optnamestr, void * optval, int * optlen)
@@ -314,7 +444,7 @@ static int libsrt_stats(URLContext *h, int read)
           if (new_fd != SRT_INVALID_SOCK) {
             pthread_mutex_lock(&s->clients_mutex);
             
-            if (s->num_clients < s->max_connections) {  // CHANGE THIS LINE
+            if (s->num_clients < s->max_connections) {
               int i;
               for (i = 0; i < MAX_CLIENTS; i++) {
                 if (!s->clients[i].active) {
@@ -334,7 +464,7 @@ static int libsrt_stats(URLContext *h, int read)
                   }
                 }
               } else {
-                av_log(h, AV_LOG_WARNING, "Maximum number of connections (%d) reached, rejecting connection\n", s->max_connections);  // CHANGE THIS LINE
+                av_log(h, AV_LOG_WARNING, "Maximum number of connections (%d) reached, rejecting connection\n", s->max_connections);
                 srt_close(new_fd);
               }
               
@@ -861,11 +991,46 @@ static int libsrt_stats(URLContext *h, int read)
                         s->max_connections, MAX_CLIENTS);
                         s->max_connections = 1;
                       }
-                    }
                   }
+                  if (av_find_info_tag(buf, sizeof(buf), "bitrate", p)) {
+                      s->bitrate = strtoll(buf, NULL, 10);
+                  }
+                  if (av_find_info_tag(buf, sizeof(buf), "burst_bits", p)) {
+                      s->burst_bits = strtoll(buf, NULL, 10);
+                  }
+                  if (av_find_info_tag(buf, sizeof(buf), "fifo_size", p)) {
+                      s->circular_buffer_size = strtol(buf, NULL, 10);
+                  }
+                }
                   ret = libsrt_setup(h, uri, flags);
                   if (ret < 0)
                   goto err;
+                  
+                  if ((flags & AVIO_FLAG_WRITE) && s->bitrate) {
+                      s->circular_buffer_size *= 188; /* Translates TS packet count to bytes */
+                      s->fifo = av_fifo_alloc2(s->circular_buffer_size, 1, 0);
+                      if (!s->fifo) {
+                          ret = AVERROR(ENOMEM);
+                          goto err;
+                      }
+                      ret = pthread_mutex_init(&s->mutex, NULL);
+                      if (ret != 0) {
+                          ret = AVERROR(ret);
+                          goto err;
+                      }
+                      ret = pthread_cond_init(&s->cond, NULL);
+                      if (ret != 0) {
+                          ret = AVERROR(ret);
+                          goto err;
+                      }
+                      ret = pthread_create(&s->circular_buffer_thread, NULL, circular_buffer_task_tx, h);
+                      if (ret != 0) {
+                          ret = AVERROR(ret);
+                          goto err;
+                      }
+                      s->thread_started = 1;
+                  }
+
                   return 0;
                   
                   err:
@@ -905,6 +1070,31 @@ static int libsrt_stats(URLContext *h, int read)
                   
                   if(s->stats > 0) {
                     libsrt_stats(h,0);
+                  }
+
+                  /* Route payload to FIFO if bitrate pacing is active */
+                  if (s->fifo) {
+                      uint8_t tmp_hdr[4];
+
+                      pthread_mutex_lock(&s->mutex);
+
+                      if (s->circular_buffer_error < 0) {
+                          int err = s->circular_buffer_error;
+                          pthread_mutex_unlock(&s->mutex);
+                          return err;
+                      }
+
+                      if (av_fifo_can_write(s->fifo) < size + 4) {
+                          pthread_mutex_unlock(&s->mutex);
+                          return AVERROR(ENOMEM);
+                      }
+
+                      AV_WL32(tmp_hdr, size);
+                      av_fifo_write(s->fifo, tmp_hdr, 4);  /* Store packet size header */
+                      av_fifo_write(s->fifo, buf, size);   /* Store actual payload */
+                      pthread_cond_signal(&s->cond);
+                      pthread_mutex_unlock(&s->mutex);
+                      return size;
                   }
                   
                   /* Multi-client write for listener mode output */
@@ -958,6 +1148,21 @@ static int libsrt_stats(URLContext *h, int read)
                 {
                   SRTContext *s = h->priv_data;
                   int i;
+
+                  /* Stop pacing thread and cleanup FIFO */
+                  if (s->thread_started && (h->flags & AVIO_FLAG_WRITE)) {
+                      pthread_mutex_lock(&s->mutex);
+                      s->close_req = 1;
+                      pthread_cond_signal(&s->cond);
+                      pthread_mutex_unlock(&s->mutex);
+
+                      pthread_join(s->circular_buffer_thread, NULL);
+                      pthread_mutex_destroy(&s->mutex);
+                      pthread_cond_destroy(&s->cond);
+                  }
+                  if (s->fifo) {
+                      av_fifo_freep2(&s->fifo);
+                  }
                   
                   /* Stop listener thread if running */
                   if (s->mode == SRT_MODE_LISTENER && s->is_output && s->listener_thread_running) {

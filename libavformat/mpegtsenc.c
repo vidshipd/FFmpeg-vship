@@ -1585,6 +1585,12 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
                      * can insert the pcr into the payload later */
                     int st2_index = i < st->index ? i : (i + 1 == s->nb_streams ? st->index : i + 1);
                     AVStream *st2 = s->streams[st2_index];
+
+                    // Prevent out-of-bounds struct casts on SCTE-35 sections
+                    if (st2->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+                        continue;
+                    }
+
                     MpegTSWriteStream *ts_st2 = st2->priv_data;
                     if (ts_st2->pcr_period) {
                         if (pcr - ts_st2->last_pcr >= ts_st2->pcr_period) {
