@@ -257,6 +257,29 @@ static int libsrt_stats(URLContext *h, int read)
       return os_errno ? AVERROR(os_errno) : AVERROR_UNKNOWN;
     }
 
+    /* A listener-mode client is dead unless its state is SRTS_CONNECTED.
+     * Covers SRTS_BROKEN (keepalive/peer-idle expired), SRTS_CLOSING/CLOSED,
+     * and SRTS_NONEXIST (already reaped by SRT's GC). */
+    static int libsrt_client_is_dead(SRTSOCKET fd)
+    {
+        return srt_getsockstate(fd) != SRTS_CONNECTED;
+    }
+
+    /* Evict a client from the table. Caller must hold s->clients_mutex. */
+    static void libsrt_evict_client_locked(URLContext *h, int idx)
+    {
+        SRTContext *s = h->priv_data;
+        SRTSOCKET fd;
+        if (!s->clients[idx].active)
+            return;
+        fd = s->clients[idx].fd;
+        s->clients[idx].active = 0;
+        s->num_clients--;
+        srt_close(fd);
+        av_log(h, AV_LOG_INFO, "Client (fd %d) disconnected (total clients: %d)\n",
+               fd, s->num_clients);
+    }
+
     static void *circular_buffer_task_tx(void *_URLContext)
     {
         URLContext *h = _URLContext;
@@ -321,11 +344,11 @@ static int libsrt_stats(URLContext *h, int read)
                         int ret = srt_sendmsg(s->clients[i].fd, s->tmp, len, -1, 1);
                         if (ret < 0) {
                             int err = srt_getlasterror(NULL);
-                            if (err == SRT_ECONNLOST || err == SRT_ENOCONN) {
-                                s->clients[i].active = 0;
-                                s->num_clients--;
-                                srt_close(s->clients[i].fd);
-                            }
+                            /* EASYNCSND is backpressure on a non-blocking socket.
+                             * Any other error: confirm via state — catches ECONNLOST,
+                             * ENOCONN, EINVSOCK (post-GC) and anything else terminal. */
+                            if (err != SRT_EASYNCSND && libsrt_client_is_dead(s->clients[i].fd))
+                                libsrt_evict_client_locked(h, i);
                         }
                     }
                 }
@@ -435,31 +458,38 @@ static int libsrt_stats(URLContext *h, int read)
       av_log(h, AV_LOG_INFO, "SRT listener thread started\n");
       
       while (s->listener_thread_running) {
+        int i;
         int len = 1, errlen = 1;
-        
+
         ret = srt_epoll_wait(s->listener_eid, ready, &len, error, &errlen, 100, 0, 0, 0, 0);
-        
+
         if (ret > 0 && len > 0) {
           SRTSOCKET new_fd = srt_accept(s->fd, NULL, NULL);
           if (new_fd != SRT_INVALID_SOCK) {
             pthread_mutex_lock(&s->clients_mutex);
-            
+
             if (s->num_clients < s->max_connections) {
-              int i;
               for (i = 0; i < MAX_CLIENTS; i++) {
                 if (!s->clients[i].active) {
                   s->clients[i].fd = new_fd;
                   s->clients[i].active = 1;
                   s->num_clients++;
-                  
+
                   /* Set non-blocking mode for the client socket */
                   libsrt_socket_nonblock(new_fd, 1);
-                  
+
                   /* Apply socket options to client */
                   libsrt_set_options_post(h, new_fd);
-                  
-                  av_log(h, AV_LOG_INFO, "New client connected: socket %d (total clients: %d)\n", 
+
+                  av_log(h, AV_LOG_INFO, "New client connected: socket %d (total clients: %d)\n",
                     new_fd, s->num_clients);
+
+                  {
+                    int latency = 0;
+                    int latency_len = sizeof(latency);
+                    if (!libsrt_getsockopt(h, new_fd, SRTO_LATENCY, "SRTO_LATENCY", &latency, &latency_len))
+                      av_log(h, AV_LOG_INFO, "SRT connection established with latency: %d ms\n", latency);
+                  }
                     break;
                   }
                 }
@@ -467,12 +497,22 @@ static int libsrt_stats(URLContext *h, int read)
                 av_log(h, AV_LOG_WARNING, "Maximum number of connections (%d) reached, rejecting connection\n", s->max_connections);
                 srt_close(new_fd);
               }
-              
+
               pthread_mutex_unlock(&s->clients_mutex);
             }
           }
+
+        /* Sweep clients for broken connections that didn't surface via a send
+         * error (silent peers, slow peers stuck on EASYNCSND, post-GC sockets).
+         * This is the authoritative liveness check per the SRT API. */
+        pthread_mutex_lock(&s->clients_mutex);
+        for (i = 0; i < MAX_CLIENTS; i++) {
+          if (s->clients[i].active && libsrt_client_is_dead(s->clients[i].fd))
+            libsrt_evict_client_locked(h, i);
         }
-        
+        pthread_mutex_unlock(&s->clients_mutex);
+      }
+
         av_log(h, AV_LOG_INFO, "SRT listener thread stopped\n");
         return NULL;
       }
@@ -1108,12 +1148,10 @@ static int libsrt_stats(URLContext *h, int read)
                         ret = srt_sendmsg(s->clients[i].fd, buf, size, -1, 1);
                         if (ret < 0) {
                           int err = srt_getlasterror(NULL);
-                          if (err == SRT_ECONNLOST || err == SRT_ENOCONN) {
-                            /* Client disconnected, remove it */
-                            s->clients[i].active = 0;
-                            s->num_clients--;
-                            srt_close(s->clients[i].fd);
-                            av_log(h, AV_LOG_INFO, "Client %d disconnected (total clients: %d)\n", s->clients[i].fd, s->num_clients);
+                          if (err == SRT_EASYNCSND) {
+                            /* Backpressure; not fatal. */
+                          } else if (libsrt_client_is_dead(s->clients[i].fd)) {
+                            libsrt_evict_client_locked(h, i);
                           } else {
                             av_log(h, AV_LOG_WARNING, "Failed to send data to client %d (fd %d): %s\n", i, s->clients[i].fd, srt_getlasterror_str());
                           }
