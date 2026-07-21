@@ -140,7 +140,9 @@ sub ffmpeg_heading_command($$$$$)
             }
         }
 
-        if ($self->in_preformatted()) {
+        # texinfo >= 7.0 renamed in_preformatted() to in_preformatted_context()
+        if ($self->can('in_preformatted_context')
+                ? $self->in_preformatted_context() : $self->in_preformatted()) {
             $result .= $heading."\n";
         } else {
             # if the level was changed, set the command name right
@@ -249,16 +251,17 @@ if ($program_version_6_8) {
 sub ffmpeg_program_string($)
 {
   my $self = shift;
+  # Build the string directly instead of via gdt()/cdt(), whose API keeps
+  # changing across texinfo versions (gdt removed in 7.1; cdt in 7.2 requires
+  # tree elements rather than strings as substitution values).
   if (defined($self->get_conf('PROGRAM'))
       and $self->get_conf('PROGRAM') ne ''
       and defined($self->get_conf('PACKAGE_URL'))) {
-    return $self->convert_tree(
-      $self->gdt('This document was generated using @uref{{program_homepage}, @emph{{program}}}.',
-         { 'program_homepage' => $self->get_conf('PACKAGE_URL'),
-           'program' => $self->get_conf('PROGRAM') }));
+    return 'This document was generated using <a href="'
+      . $self->get_conf('PACKAGE_URL') . '"><em>'
+      . $self->get_conf('PROGRAM') . '</em></a>.';
   } else {
-    return $self->convert_tree(
-      $self->gdt('This document was generated automatically.'));
+    return 'This document was generated automatically.';
   }
 }
 if ($program_version_6_8) {

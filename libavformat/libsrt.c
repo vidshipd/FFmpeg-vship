@@ -115,6 +115,10 @@ typedef struct SRTContext {
   int num_clients;
   int max_connections;
 
+  /* Caller-mode reconnection: keep retrying when the listener is offline */
+  int connect_retries;
+  int64_t connect_retry_interval;
+
   /* --- Additions for Bitrate Pacing --- */
   int64_t bitrate;
   int64_t burst_bits;
@@ -182,6 +186,8 @@ static const AVOption libsrt_options[] = {
   { "linger",         "Number of seconds that the socket waits for unsent data when closing", OFFSET(linger),           AV_OPT_TYPE_INT,      { .i64 = -1 }, -1, INT_MAX,   .flags = D|E },
   { "tsbpd",          "Timestamp-based packet delivery",                                      OFFSET(tsbpd),            AV_OPT_TYPE_BOOL,     { .i64 = -1 }, -1, 1,         .flags = D|E },
   { "max_connections", "Maximum number of connections in listener mode (output only)",        OFFSET(max_connections),  AV_OPT_TYPE_INT,      { .i64 = 1 },   1, MAX_CLIENTS, .flags = E },
+  { "connect_retries", "Caller mode: number of connection attempts before giving up (-1 = retry forever)", OFFSET(connect_retries), AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, INT_MAX, .flags = D|E },
+  { "connect_retry_interval", "Caller mode: delay between connection attempts (in microseconds)", OFFSET(connect_retry_interval), AV_OPT_TYPE_INT64, { .i64 = 10000000 }, 0, INT64_MAX, .flags = D|E },
   { "bitrate",         "Bits to send per second",                                             OFFSET(bitrate),          AV_OPT_TYPE_INT64,    { .i64 = 0  },  0, INT64_MAX, .flags = E },
   { "burst_bits",      "Max length of bursts in bits (when using bitrate)",                   OFFSET(burst_bits),       AV_OPT_TYPE_INT64,    { .i64 = 0  },  0, INT64_MAX, .flags = E },
   { "fifo_size",       "set the SRT sending circular buffer size (in 188-byte packets)",      OFFSET(circular_buffer_size), AV_OPT_TYPE_INT,  { .i64 = 7*4096 }, 0, INT_MAX, .flags = E },
@@ -675,6 +681,20 @@ static int libsrt_stats(URLContext *h, int read)
           }
           
           
+          /* Sleep for up to delay microseconds, waking early with AVERROR_EXIT if
+          the operation is interrupted (e.g. user pressed 'q' / Ctrl-C).
+          Returns 0 when the full delay elapsed. */
+          static int libsrt_sleep_interruptible(URLContext *h, int64_t delay)
+          {
+            int64_t deadline = av_gettime_relative() + delay;
+            while (av_gettime_relative() < deadline) {
+              if (ff_check_interrupt(&h->interrupt_callback))
+              return AVERROR_EXIT;
+              av_usleep(100000); /* 100 ms polling granularity */
+            }
+            return 0;
+          }
+
           static int libsrt_setup(URLContext *h, const char *uri, int flags)
           {
             struct addrinfo hints = { 0 }, *ai, *cur_ai;
@@ -687,7 +707,9 @@ static int libsrt_stats(URLContext *h, int read)
             char portstr[10];
             int64_t open_timeout = 0;
             int eid, write_eid;
-            
+            int connect_attempts = 0;
+            int connect_failed = 0;
+
             av_url_split(proto, sizeof(proto), NULL, 0, hostname, sizeof(hostname),
             &port, path, sizeof(path), uri);
             if (strcmp(proto, "srt"))
@@ -724,7 +746,8 @@ static int libsrt_stats(URLContext *h, int read)
               cur_ai = ai;
               
               restart:
-              
+              connect_failed = 0;
+
               #if SRT_VERSION_VALUE >= 0x010401
               fd = srt_create_socket();
               #else
@@ -839,8 +862,12 @@ static int libsrt_stats(URLContext *h, int read)
                   if (ret < 0) {
                     if (ret == AVERROR_EXIT)
                     goto fail1;
-                    else
+                    else {
+                    /* Connection attempt failed (e.g. listener offline). Flag it
+                    so the fail handler can retry instead of aborting. */
+                    connect_failed = 1;
                     goto fail;
+                    }
                   }
                 }
                 if ((ret = libsrt_set_options_post(h, fd)) < 0) {
@@ -874,6 +901,33 @@ static int libsrt_stats(URLContext *h, int read)
                   cur_ai = cur_ai->ai_next;
                   if (fd >= 0)
                   srt_close(fd);
+                  ret = 0;
+                  goto restart;
+                }
+                /* In caller mode, if the connection failed because the remote
+                listener isn't reachable yet, keep retrying (from the first
+                resolved address) rather than giving up. A genuine local error
+                (socket creation, option setup) does not set connect_failed and
+                so still aborts here. The wait is interruptible so the user can
+                still quit. */
+                if (connect_failed && s->mode == SRT_MODE_CALLER &&
+                    (s->connect_retries < 0 || connect_attempts < s->connect_retries)) {
+                  int sret;
+                  connect_attempts++;
+                  av_log(h, AV_LOG_WARNING,
+                    "Connection to %s failed (attempt %d): %s. Retrying in %g s...\n",
+                    h->filename, connect_attempts, av_err2str(ret),
+                    s->connect_retry_interval / 1000000.0);
+                  if (fd >= 0) {
+                    srt_close(fd);
+                    fd = -1;
+                  }
+                  sret = libsrt_sleep_interruptible(h, s->connect_retry_interval);
+                  if (sret < 0) {
+                    ret = sret; /* interrupted while waiting */
+                    goto fail1;
+                  }
+                  cur_ai = ai; /* restart from the first resolved address */
                   ret = 0;
                   goto restart;
                 }
@@ -1040,6 +1094,12 @@ static int libsrt_stats(URLContext *h, int read)
                   }
                   if (av_find_info_tag(buf, sizeof(buf), "fifo_size", p)) {
                       s->circular_buffer_size = strtol(buf, NULL, 10);
+                  }
+                  if (av_find_info_tag(buf, sizeof(buf), "connect_retries", p)) {
+                      s->connect_retries = strtol(buf, NULL, 10);
+                  }
+                  if (av_find_info_tag(buf, sizeof(buf), "connect_retry_interval", p)) {
+                      s->connect_retry_interval = strtoll(buf, NULL, 10);
                   }
                 }
                   ret = libsrt_setup(h, uri, flags);
