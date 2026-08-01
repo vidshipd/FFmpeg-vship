@@ -37,8 +37,14 @@ const static struct cc_lookup cc_lookup_vals[] = {
     { 15, 1, 40, 4 },
     { 24, 1, 25, 3 },
     { 24000, 1001, 25, 3 },
+    /* Non-standard PAL extension: CEA-608/708 defines no 25fps cadence,
+       but we keep the CC data rate constant (cc_count*fps ~= 600 tuples/sec,
+       num_608 rounded up from 60/25) so 608/708 data survives a rate change. */
+    { 25, 1, 24, 3 },
     { 30, 1, 20, 2 },
     { 30000, 1001, 20, 2},
+    /* Non-standard PAL extension, same rationale as 25fps above. */
+    { 50, 1, 12, 2 },
     { 60, 1, 10, 1 },
     { 60000, 1001, 10, 1},
 };
