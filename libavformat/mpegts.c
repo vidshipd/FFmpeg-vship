@@ -2574,6 +2574,14 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                 st->id = pid;
                 st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
                 if (stream_type == 0x86 && prog_reg_desc == AV_RL32("CUEI")) {
+                    /* This branch does not go through mpegts_set_stream_info(),
+                     * so the pts info has to be set up here.  Without it the
+                     * stream is left with a 0/0 time base and pts_wrap_bits of
+                     * zero, which makes update_wrap_reference() mask the
+                     * timestamp down to 0 and spuriously flag a rollover for
+                     * every stream in the program.  The timestamps handed out
+                     * by scte_data_cb() are 33 bit 90kHz values. */
+                    avpriv_set_pts_info(st, 33, 1, 90000);
                     mpegts_find_stream_type(st, stream_type, SCTE_types);
                     mpegts_open_section_filter(ts, pid, scte_data_cb, ts, 1);
                 }
