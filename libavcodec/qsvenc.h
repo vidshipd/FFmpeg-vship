@@ -74,6 +74,9 @@
 { "adaptive", "Enable HyperEncode mode or fallback to single GPU if incompatible parameters during initialization", 0, AV_OPT_TYPE_CONST, { .i64 = MFX_HYPERMODE_ADAPTIVE  },   INT_MIN, INT_MAX, VE, "dual_gfx" },
 #endif
 
+#define QSV_OPTION_A53CC \
+{ "a53cc" , "Use A53 Closed Captions (if available)", OFFSET(qsv.a53_cc), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VE },
+
 #define QSV_OPTION_RDO \
 { "rdo",            "Enable rate distortion optimization",    OFFSET(qsv.rdo),            AV_OPT_TYPE_INT, { .i64 = -1 }, -1,          1, VE },
 
@@ -322,5 +325,16 @@ int ff_qsv_encode(AVCodecContext *avctx, QSVEncContext *q,
                   AVPacket *pkt, const AVFrame *frame, int *got_packet);
 
 int ff_qsv_enc_close(AVCodecContext *avctx, QSVEncContext *q);
+
+/**
+ * Turn the A/53 Part 4 closed captions carried by frame, if any, into an SEI
+ * message appended to enc_ctrl's payload list. The payload is owned by
+ * enc_ctrl and freed along with it.
+ *
+ * @return Zero on success (including when there are no captions to insert),
+ *         a negative error code on failure.
+ */
+int ff_qsv_enc_add_a53_sei(AVCodecContext *avctx, const AVFrame *frame,
+                           mfxEncodeCtrl *enc_ctrl);
 
 #endif /* AVCODEC_QSVENC_H */

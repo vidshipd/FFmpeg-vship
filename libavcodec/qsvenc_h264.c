@@ -33,7 +33,6 @@
 #include "codec_internal.h"
 #include "qsv.h"
 #include "qsvenc.h"
-#include "atsc_a53.h"
 
 typedef struct QSVH264EncContext {
     AVClass *class;
@@ -46,31 +45,9 @@ static int qsv_h264_set_encode_ctrl(AVCodecContext *avctx,
     QSVH264EncContext *qh264 = avctx->priv_data;
     QSVEncContext *q = &qh264->qsv;
 
-    if (q->a53_cc && frame) {
-        mfxPayload* payload;
-        mfxU8* sei_data;
-        size_t sei_size;
-        int res;
+    if (q->a53_cc)
+        return ff_qsv_enc_add_a53_sei(avctx, frame, enc_ctrl);
 
-        res = ff_alloc_a53_sei(frame, sizeof(mfxPayload) + 2, (void**)&payload, &sei_size);
-        if (res < 0 || !payload)
-            return res;
-
-        sei_data = (mfxU8*)(payload + 1);
-        // SEI header
-        sei_data[0] = 4;
-        sei_data[1] = (mfxU8)sei_size; // size of SEI data
-        // SEI data filled in by ff_alloc_a53_sei
-
-        payload->BufSize = sei_size + 2;
-        payload->NumBit = payload->BufSize * 8;
-        payload->Type = 4;
-        payload->Data = sei_data;
-
-        enc_ctrl->NumExtParam = 0;
-        enc_ctrl->NumPayload = 1;
-        enc_ctrl->Payload[0] = payload;
-    }
     return 0;
 }
 
@@ -155,7 +132,7 @@ static const AVOption options[] = {
     { "main"    , NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_PROFILE_AVC_MAIN     }, INT_MIN, INT_MAX,     VE, "profile" },
     { "high"    , NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_PROFILE_AVC_HIGH     }, INT_MIN, INT_MAX,     VE, "profile" },
 
-    { "a53cc" , "Use A53 Closed Captions (if available)", OFFSET(qsv.a53_cc), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VE},
+    QSV_OPTION_A53CC
 
     { "aud", "Insert the Access Unit Delimiter NAL", OFFSET(qsv.aud), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE},
 

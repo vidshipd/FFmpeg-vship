@@ -40,6 +40,7 @@
 #include "libavutil/pixfmt.h"
 #include "libavutil/time.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/film_grain_params.h"
 #include "libavutil/mastering_display_metadata.h"
 
@@ -48,8 +49,12 @@
 #include "internal.h"
 #include "decode.h"
 #include "hwconfig.h"
+#include "atsc_a53.h"
+#include "h264.h"
+#include "hevc.h"
 #include "qsv.h"
 #include "qsv_internal.h"
+#include "sei.h"
 
 #if QSV_ONEVPL
 #include <mfxdispatcher.h>
@@ -66,6 +71,20 @@ static const AVRational mfx_tb = { 1, 90000 };
 #define MFX_PTS_TO_PTS(mfx_pts, pts_tb) ((mfx_pts) == MFX_TIMESTAMP_UNKNOWN ? \
     AV_NOPTS_VALUE : pts_tb.num ? \
     av_rescale_q(mfx_pts, mfx_tb, pts_tb) : mfx_pts)
+
+/* How many not-yet-output frames worth of closed captions to keep around.
+ * The SDK can hold on to async_depth frames plus the codec reordering delay. */
+#define QSV_MAX_A53_QUEUE 128
+
+/* Upper bound on the caption payload we accumulate for a single frame, same
+ * limit the MPEG-2 decoder applies. */
+#define QSV_MAX_A53_SIZE (3 * 2000)
+
+typedef struct QSVA53Payload {
+    /* mfx-domain timestamp of the coded frame these captions came from */
+    int64_t      timestamp;
+    AVBufferRef *buf;
+} QSVA53Payload;
 
 typedef struct QSVAsyncFrame {
     mfxSyncPoint *sync;
@@ -108,6 +127,16 @@ typedef struct QSVContext {
 
     mfxExtBuffer **ext_buffers;
     int         nb_ext_buffers;
+
+    /**
+     * A/53 Part 4 closed captions pulled out of the input bitstream, waiting
+     * for the SDK to hand us the frame they belong to. Kept in input order and
+     * keyed by the mfx timestamp we passed in with the coded frame, which the
+     * SDK copies onto the matching output surface.
+     */
+    QSVA53Payload a53_queue[QSV_MAX_A53_QUEUE];
+    int nb_a53_queue;
+    int a53_nopts_warned;
 } QSVContext;
 
 static const AVCodecHWConfigInternal *const qsv_hw_configs[] = {
@@ -697,6 +726,280 @@ static int qsv_export_hdr_side_data(AVCodecContext *avctx, mfxExtMasteringDispla
 
 #endif
 
+/*
+ * The QSV decoders hand the coded bitstream straight to the SDK, which does not
+ * give SEI / user data messages back to us. Closed captions would therefore be
+ * dropped on the floor, unlike with the hwaccel-based decoders where the native
+ * bitstream parser sees them. So parse just enough of the bitstream ourselves to
+ * recover them, and attach them to the matching output frame further down.
+ */
+
+/* Locate the next 00 00 01 start code prefix in [p, end), or return end. */
+static const uint8_t *qsv_find_startcode(const uint8_t *p, const uint8_t *end)
+{
+    while (end - p >= 3) {
+        /* A prefix covering any of p[0..2] needs p[2] to be either 0 or 1, so
+         * anything else lets us skip the whole triplet. */
+        if (p[2] > 1)
+            p += 3;
+        else if (p[2] == 1) {
+            if (!p[0] && !p[1])
+                return p;
+            p += 3;
+        } else
+            p++;
+    }
+
+    return end;
+}
+
+/* Parse an itu_t_t35 payload, keeping ATSC A/53 Part 4 closed captions. */
+static void qsv_parse_a53_t35(AVBufferRef **pbuf, const uint8_t *buf, int size)
+{
+    if (size < 8                                     ||
+        buf[0] != 0xb5                               || /* USA country code */
+        AV_RB16(buf + 1) != 0x0031                   || /* ATSC provider code */
+        AV_RB32(buf + 3) != MKBETAG('G', 'A', '9', '4'))
+        return;
+
+    ff_parse_a53_cc(pbuf, buf + 7, size - 7);
+}
+
+/* Walk the sei_message() elements of one unescaped SEI RBSP. */
+static void qsv_parse_sei(AVBufferRef **pbuf, const uint8_t *buf, int size)
+{
+    const uint8_t *p   = buf;
+    const uint8_t *end = buf + size;
+
+    while (end - p > 2 && (p[0] || p[1])) {
+        unsigned type = 0, payload_size = 0;
+
+        do {
+            if (p >= end || type > INT_MAX - 255)
+                return;
+            type += *p;
+        } while (*p++ == 0xff);
+
+        do {
+            if (p >= end || payload_size > INT_MAX - 255)
+                return;
+            payload_size += *p;
+        } while (*p++ == 0xff);
+
+        if (payload_size > (size_t)(end - p))
+            return;
+
+        if (type == SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35)
+            qsv_parse_a53_t35(pbuf, p, payload_size);
+
+        p += payload_size;
+    }
+}
+
+/* Collect the closed captions carried by one input packet into *pbuf. */
+static int qsv_extract_a53_cc(AVCodecContext *avctx, const AVPacket *pkt,
+                              AVBufferRef **pbuf)
+{
+    const uint8_t *p, *end;
+    uint8_t *rbsp = NULL;
+    int rbsp_size = 0;
+    int ret       = 0;
+
+    if (!pkt->size)
+        return 0;
+
+    if (avctx->codec_id != AV_CODEC_ID_H264 &&
+        avctx->codec_id != AV_CODEC_ID_HEVC &&
+        avctx->codec_id != AV_CODEC_ID_MPEG2VIDEO)
+        return 0;
+
+    p   = pkt->data;
+    end = pkt->data + pkt->size;
+
+    while ((p = qsv_find_startcode(p, end)) != end) {
+        const uint8_t *nal, *nal_end;
+        int hdr, nal_size, i, j;
+
+        p += 3;
+        if (p >= end)
+            break;
+
+        hdr     = *p;
+        nal     = p;
+        nal_end = qsv_find_startcode(p, end);
+        p       = nal_end;
+
+        switch (avctx->codec_id) {
+        case AV_CODEC_ID_H264:
+            if ((hdr & 0x1f) != H264_NAL_SEI)
+                continue;
+            nal += 1;                   /* nal_unit_header() */
+            break;
+        case AV_CODEC_ID_HEVC:
+            hdr = (hdr >> 1) & 0x3f;
+            if (hdr != HEVC_NAL_SEI_PREFIX && hdr != HEVC_NAL_SEI_SUFFIX)
+                continue;
+            nal += 2;                   /* nal_unit_header() */
+            break;
+        case AV_CODEC_ID_MPEG2VIDEO:
+            if (hdr != 0xb2)            /* user_data_start_code */
+                continue;
+            nal += 1;
+            /* MPEG-2 user data must not contain start codes, so it is not
+             * escaped and can be handed over as is. */
+            if (nal_end - nal >= 5 &&
+                AV_RB32(nal) == MKBETAG('G', 'A', '9', '4'))
+                ff_parse_a53_cc(pbuf, nal + 4, nal_end - nal - 4);
+            continue;
+        default:
+            goto done;
+        }
+
+        nal_size = nal_end - nal;
+        if (nal_size <= 0)
+            continue;
+
+        if (rbsp_size < nal_size) {
+            uint8_t *tmp = av_realloc(rbsp, nal_size);
+            if (!tmp) {
+                ret = AVERROR(ENOMEM);
+                goto done;
+            }
+            rbsp      = tmp;
+            rbsp_size = nal_size;
+        }
+
+        /* undo emulation prevention */
+        for (i = j = 0; i < nal_size; i++) {
+            if (i + 2 < nal_size && !nal[i] && !nal[i + 1] && nal[i + 2] == 3) {
+                rbsp[j++] = 0;
+                rbsp[j++] = 0;
+                i        += 2;
+            } else
+                rbsp[j++] = nal[i];
+        }
+
+        qsv_parse_sei(pbuf, rbsp, j);
+    }
+
+done:
+    av_free(rbsp);
+
+    return ret;
+}
+
+static void qsv_a53_queue_clear(QSVContext *q)
+{
+    int i;
+
+    for (i = 0; i < q->nb_a53_queue; i++)
+        av_buffer_unref(&q->a53_queue[i].buf);
+    q->nb_a53_queue = 0;
+}
+
+/* Drop consumed entries and those belonging to frames the decoder has already
+ * moved past; output comes out in display order, so a smaller timestamp can
+ * never be asked for again. */
+static void qsv_a53_queue_prune(QSVContext *q, int64_t timestamp)
+{
+    int i, n = 0;
+
+    for (i = 0; i < q->nb_a53_queue; i++) {
+        if (!q->a53_queue[i].buf || q->a53_queue[i].timestamp < timestamp) {
+            av_buffer_unref(&q->a53_queue[i].buf);
+            continue;
+        }
+        q->a53_queue[n++] = q->a53_queue[i];
+    }
+
+    q->nb_a53_queue = n;
+}
+
+/* Queue the captions of one coded frame. Takes ownership of *pbuf. */
+static void qsv_a53_queue_push(AVCodecContext *avctx, QSVContext *q,
+                               int64_t timestamp, AVBufferRef **pbuf)
+{
+    QSVA53Payload *last;
+
+    if (!*pbuf)
+        return;
+
+    /* The timestamp is the only handle the SDK gives us on which output frame a
+     * coded frame became, so captions we cannot key are of no use. */
+    if (timestamp == MFX_TIMESTAMP_UNKNOWN) {
+        av_log_once(avctx, AV_LOG_WARNING, AV_LOG_VERBOSE, &q->a53_nopts_warned,
+                    "Dropping closed captions from packets without a timestamp\n");
+        av_buffer_unref(pbuf);
+        return;
+    }
+
+    last = q->nb_a53_queue ? &q->a53_queue[q->nb_a53_queue - 1] : NULL;
+    if (last && last->timestamp == timestamp) {
+        /* Same coded frame as the previous packet, e.g. the second field of a
+         * field-coded picture: append, the way a software decoder merges the
+         * captions of both fields into one frame. */
+        size_t old_size = last->buf->size;
+
+        if (old_size + (*pbuf)->size <= QSV_MAX_A53_SIZE &&
+            av_buffer_realloc(&last->buf, old_size + (*pbuf)->size) >= 0)
+            memcpy(last->buf->data + old_size, (*pbuf)->data, (*pbuf)->size);
+        av_buffer_unref(pbuf);
+        return;
+    }
+
+    if (q->nb_a53_queue == QSV_MAX_A53_QUEUE) {
+        /* Never claimed, so the decoder must have dropped that frame. */
+        av_buffer_unref(&q->a53_queue[0].buf);
+        memmove(q->a53_queue, q->a53_queue + 1,
+                (QSV_MAX_A53_QUEUE - 1) * sizeof(*q->a53_queue));
+        q->nb_a53_queue--;
+    }
+
+    q->a53_queue[q->nb_a53_queue].timestamp = timestamp;
+    q->a53_queue[q->nb_a53_queue].buf       = *pbuf;
+    q->nb_a53_queue++;
+    *pbuf = NULL;
+}
+
+/* Attach the captions of the coded frame with the given timestamp, if any. */
+static int qsv_a53_attach(AVCodecContext *avctx, QSVContext *q,
+                          int64_t timestamp, AVFrame *frame)
+{
+    AVBufferRef *buf = NULL;
+    int i;
+
+    if (!q->nb_a53_queue || timestamp == MFX_TIMESTAMP_UNKNOWN)
+        return 0;
+
+    /* Input is in decode order, so the queue is not sorted by timestamp. */
+    for (i = 0; i < q->nb_a53_queue; i++) {
+        if (q->a53_queue[i].timestamp == timestamp) {
+            buf = q->a53_queue[i].buf;
+            q->a53_queue[i].buf = NULL;
+            break;
+        }
+    }
+
+    qsv_a53_queue_prune(q, timestamp);
+
+    if (!buf)
+        return 0;
+
+    /* ff_decode_frame_props() copies the side data of whichever packet happened
+     * to be current when this surface was allocated, which need not be the one
+     * this frame was decoded from. Ours is the authoritative one. */
+    av_frame_remove_side_data(frame, AV_FRAME_DATA_A53_CC);
+
+    if (!av_frame_new_side_data_from_buf(frame, AV_FRAME_DATA_A53_CC, buf)) {
+        av_buffer_unref(&buf);
+        return AVERROR(ENOMEM);
+    }
+
+    avctx->properties |= FF_CODEC_PROPERTY_CLOSED_CAPTIONS;
+
+    return 0;
+}
+
 static int qsv_decode(AVCodecContext *avctx, QSVContext *q,
                       AVFrame *frame, int *got_frame,
                       const AVPacket *avpkt)
@@ -809,6 +1112,10 @@ static int qsv_decode(AVCodecContext *avctx, QSVContext *q,
         outsurf = &aframe.frame->surface;
 
         frame->pts = MFX_PTS_TO_PTS(outsurf->Data.TimeStamp, avctx->pkt_timebase);
+
+        ret = qsv_a53_attach(avctx, q, (int64_t)outsurf->Data.TimeStamp, frame);
+        if (ret < 0)
+            return ret;
 #if QSV_VERSION_ATLEAST(1, 34)
         if ((avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN) &&
             QSV_RUNTIME_VERSION_ATLEAST(q->ver, 1, 34) &&
@@ -876,6 +1183,8 @@ static void qsv_decode_close_qsvcontext(QSVContext *q)
         av_freep(&cur);
         cur = q->work_frames;
     }
+
+    qsv_a53_queue_clear(q);
 
     ff_qsv_close_internal_session(&q->internal_qs);
 
@@ -1074,8 +1383,22 @@ static int qsv_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                 return avpkt->size ? avpkt->size : qsv_process_data(avctx, &s->qsv, frame, got_frame, avpkt);
             /* in progress of reinit, no read from fifo and keep the buffer_pkt */
             if (!s->qsv.reinit_flag) {
+                AVBufferRef *a53_buf = NULL;
+
                 av_packet_unref(&s->buffer_pkt);
                 av_fifo_read(s->packet_fifo, &s->buffer_pkt, 1);
+
+                /* Look for closed captions here, exactly once per packet: below
+                 * the packet may be handed to the SDK in several chunks. */
+                ret = qsv_extract_a53_cc(avctx, &s->buffer_pkt, &a53_buf);
+                if (ret < 0) {
+                    av_buffer_unref(&a53_buf);
+                    return ret;
+                }
+                qsv_a53_queue_push(avctx, &s->qsv,
+                                   PTS_TO_MFX_PTS(s->buffer_pkt.pts,
+                                                  avctx->pkt_timebase),
+                                   &a53_buf);
             }
         }
 
@@ -1104,6 +1427,7 @@ static void qsv_decode_flush(AVCodecContext *avctx)
     QSVDecContext *s = avctx->priv_data;
 
     qsv_clear_buffers(s);
+    qsv_a53_queue_clear(&s->qsv);
 
     s->qsv.orig_pix_fmt = AV_PIX_FMT_NONE;
     s->qsv.initialized = 0;

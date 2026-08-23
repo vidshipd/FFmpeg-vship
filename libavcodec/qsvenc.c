@@ -34,6 +34,7 @@
 #include "libavutil/time.h"
 #include "libavutil/imgutils.h"
 
+#include "atsc_a53.h"
 #include "avcodec.h"
 #include "encode.h"
 #include "internal.h"
@@ -41,6 +42,7 @@
 #include "qsv.h"
 #include "qsv_internal.h"
 #include "qsvenc.h"
+#include "sei.h"
 
 struct profile_names {
     mfxU16 profile;
@@ -1751,6 +1753,59 @@ int ff_qsv_enc_init(AVCodecContext *avctx, QSVEncContext *q)
     }
 
     q->avctx = avctx;
+
+    return 0;
+}
+
+/* Room reserved for the sei_message() header (payload_type plus payload_size,
+ * each of which may need 0xff continuation bytes) in front of the payload. */
+#define QSV_SEI_HEADER_MAX 8
+
+int ff_qsv_enc_add_a53_sei(AVCodecContext *avctx, const AVFrame *frame,
+                           mfxEncodeCtrl *enc_ctrl)
+{
+    mfxPayload *payload;
+    uint8_t *data, *hdr;
+    size_t sei_size, nb_ff, i;
+    int ret;
+
+    if (!frame || !enc_ctrl || enc_ctrl->NumPayload >= QSV_MAX_ENC_PAYLOAD)
+        return 0;
+
+    /* The SDK wants one allocation holding the mfxPayload followed by a
+     * complete sei_message(), and frees it for us in free_encoder_ctrl(). */
+    ret = ff_alloc_a53_sei(frame, sizeof(*payload) + QSV_SEI_HEADER_MAX,
+                           (void **)&payload, &sei_size);
+    if (ret < 0)
+        return ret;
+    if (!payload)
+        return 0;
+
+    data = (uint8_t *)payload + sizeof(*payload) + QSV_SEI_HEADER_MAX;
+    hdr  = data;
+
+    /* payload_size is coded as N 0xff bytes followed by the remainder */
+    nb_ff = sei_size / 255;
+
+    if (nb_ff + 2 > QSV_SEI_HEADER_MAX || sei_size + nb_ff + 2 > UINT16_MAX) {
+        av_log(avctx, AV_LOG_WARNING, "Closed caption SEI of %d bytes is too "
+               "large to insert, skipping\n", (int)sei_size);
+        av_free(payload);
+        return 0;
+    }
+
+    /* build the header backwards, so that it ends up right before the payload */
+    *--hdr = sei_size % 255;
+    for (i = 0; i < nb_ff; i++)
+        *--hdr = 0xff;
+    *--hdr = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
+
+    payload->Data    = hdr;
+    payload->BufSize = data - hdr + sei_size;
+    payload->NumBit  = payload->BufSize * 8;
+    payload->Type    = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
+
+    enc_ctrl->Payload[enc_ctrl->NumPayload++] = payload;
 
     return 0;
 }

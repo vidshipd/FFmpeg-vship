@@ -27,6 +27,7 @@
 #include <mfxvideo.h>
 
 #include "avfilter.h"
+#include "ccfifo.h"
 #include "libavutil/fifo.h"
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_qsv.h"
@@ -100,6 +101,12 @@ typedef struct QSVVPPContext {
 
     mfxVersion ver;
     int vpp_initted;
+
+    /** Closed captions are carried per frame, so they have to be re-timed when
+     * VPP does not output exactly one frame per input frame. Only set up for
+     * single-input filters whose output frame rate differs from the input's. */
+    CCFifo cc_fifo;
+    int cc_fifo_initted;
 } QSVVPPContext;
 
 typedef struct QSVVPPCrop {

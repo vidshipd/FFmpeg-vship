@@ -3726,6 +3726,9 @@ Insert the Access Unit Delimiter NAL.
 @item @var{pic_timing_sei}
 Insert picture timing SEI with pic_struct_syntax element.
 
+@item @var{a53cc}
+Use A53 Closed Captions (if available).
+
 @item @var{transform_skip}
 Turn this option ON to enable transformskip. It is supported on platform equal
 or newer than ICL.

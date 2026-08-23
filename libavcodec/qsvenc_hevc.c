@@ -166,8 +166,18 @@ static int qsv_hevc_set_encode_ctrl(AVCodecContext *avctx,
 {
     QSVHEVCEncContext *q = avctx->priv_data;
     AVFrameSideData *sd;
+    int ret;
 
-    if (!frame || !QSV_RUNTIME_VERSION_ATLEAST(q->qsv.ver, 1, 25))
+    if (!frame)
+        return 0;
+
+    if (q->qsv.a53_cc) {
+        ret = ff_qsv_enc_add_a53_sei(avctx, frame, enc_ctrl);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (!QSV_RUNTIME_VERSION_ATLEAST(q->qsv.ver, 1, 25))
         return 0;
 
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
@@ -353,6 +363,7 @@ static const AVOption options[] = {
     { "recovery_point_sei", "Insert recovery point SEI messages",       OFFSET(qsv.recovery_point_sei),      AV_OPT_TYPE_INT, { .i64 = -1 },               -1,          1, VE },
     { "aud", "Insert the Access Unit Delimiter NAL", OFFSET(qsv.aud), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE},
     { "pic_timing_sei",    "Insert picture timing SEI with pic_struct_syntax element", OFFSET(qsv.pic_timing_sei), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
+    QSV_OPTION_A53CC
     { "transform_skip", "Turn this option ON to enable transformskip",   OFFSET(qsv.transform_skip),          AV_OPT_TYPE_INT,    { .i64 = -1},   -1, 1,  VE},
     { "int_ref_type", "Intra refresh type. B frames should be set to 0",         OFFSET(qsv.int_ref_type),            AV_OPT_TYPE_INT, { .i64 = -1 }, -1, UINT16_MAX, VE, "int_ref_type" },
         { "none",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, .flags = VE, "int_ref_type" },

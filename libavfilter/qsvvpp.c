@@ -871,6 +871,26 @@ int ff_qsvvpp_init(AVFilterContext *avctx, QSVVPPParam *param)
     } else if (ret > 0)
         ff_qsvvpp_print_warning(avctx, ret, "Warning When querying VPP params");
 
+    /* Closed captions ride along on the frames, so a frame rate change (which is
+     * also how field-rate deinterlacing shows up here) has to redistribute them
+     * over the output frames instead of copying or dropping them wholesale.
+     * With equal rates VPP is strictly 1:1 and the captions can just ride along,
+     * and with more than one input there is no single caption stream to re-time.
+     */
+    if (avctx->nb_inputs == 1 &&
+        av_cmp_q(avctx->inputs[0]->frame_rate, avctx->outputs[0]->frame_rate)) {
+        if (s->cc_fifo_initted) {
+            ff_ccfifo_uninit(&s->cc_fifo);
+            s->cc_fifo_initted = 0;
+        }
+        ret = ff_ccfifo_init(&s->cc_fifo, avctx->outputs[0]->frame_rate, avctx);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to initialize CC FIFO\n");
+            goto failed;
+        }
+        s->cc_fifo_initted = 1;
+    }
+
     return 0;
 
 failed:
@@ -953,6 +973,10 @@ int ff_qsvvpp_close(AVFilterContext *avctx)
     av_freep(&s->ext_buffers);
     av_freep(&s->frame_infos);
     av_fifo_freep2(&s->async_fifo);
+    if (s->cc_fifo_initted) {
+        ff_ccfifo_uninit(&s->cc_fifo);
+        s->cc_fifo_initted = 0;
+    }
 
     return 0;
 }
@@ -965,6 +989,7 @@ int ff_qsvvpp_filter_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *picr
     mfxSyncPoint      sync;
     QSVFrame         *in_frame, *out_frame;
     int               ret, ret1, filter_ret;
+    int               nb_out = 0;
 
     while (s->eof && av_fifo_read(s->async_fifo, &aframe, 1) >= 0) {
         if (MFXVideoCORE_SyncOperation(s->session, aframe.sync, 1000) < 0)
@@ -989,6 +1014,12 @@ int ff_qsvvpp_filter_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *picr
                FF_INLINK_IDX(inlink));
         return AVERROR(ENOMEM);
     }
+
+    /* Take the captions off the input frame (a private copy of picref, so the
+     * caller's frame is untouched) and hand them back out at the output frame
+     * rate below. */
+    if (s->cc_fifo_initted)
+        ff_ccfifo_extract(&s->cc_fifo, in_frame->frame);
 
     do {
         out_frame = query_frame(s, outlink, in_frame->frame);
@@ -1016,6 +1047,14 @@ int ff_qsvvpp_filter_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *picr
         }
         out_frame->frame->pts = av_rescale_q(out_frame->surface.Data.TimeStamp,
                                              default_tb, outlink->time_base);
+
+        /* query_frame() copied the input's side data onto every output frame of
+         * this input frame; repeating the captions verbatim would corrupt the
+         * 608/708 stream, so only the first one may keep them. */
+        if (nb_out++)
+            av_frame_remove_side_data(out_frame->frame, AV_FRAME_DATA_A53_CC);
+        if (s->cc_fifo_initted)
+            ff_ccfifo_inject(&s->cc_fifo, out_frame->frame);
 
         out_frame->queued++;
         aframe = (QSVAsyncFrame){ sync, out_frame };
