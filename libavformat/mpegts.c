@@ -266,6 +266,10 @@ typedef struct PESContext {
     int extended_stream_id;
     uint8_t stream_id;
     int64_t pts, dts;
+    /** PTS of the most recent PES packet seen on this pid, as carried in the
+     *  stream (33 bit, 90kHz).  Unlike pts, this is not cleared between PES
+     *  packets, so it remains valid while a packet without a PTS is parsed. */
+    int64_t last_pts;
     int64_t ts_packet_pos; /**< position of first TS packet of this PES packet */
     uint8_t header[MAX_PES_HEADER_SIZE];
     AVBufferRef *buffer;
@@ -1291,6 +1295,12 @@ skip:
                     pes->dts = ff_parse_pes_pts(r);
                     r += 5;
                 }
+                /* Latch the PTS so SCTE-35 sections can be timestamped against
+                 * the adjacent video frame (see scte_data_cb()).  Recorded for
+                 * every pid rather than just video ones, since codec_type may
+                 * not be known yet while a stream is still being probed. */
+                if (pes->pts != AV_NOPTS_VALUE)
+                    pes->last_pts = pes->pts;
                 pes->extended_stream_id = -1;
                 if (flags & 0x01) { /* PES extension */
                     pes_ext = *r++;
@@ -1457,6 +1467,7 @@ static PESContext *add_pes_stream(MpegTSContext *ts, int pid, int pcr_pid)
     pes->state   = MPEGTS_SKIP;
     pes->pts     = AV_NOPTS_VALUE;
     pes->dts     = AV_NOPTS_VALUE;
+    pes->last_pts = AV_NOPTS_VALUE;
     tss          = mpegts_open_pes_filter(ts, pid, mpegts_push_data, pes);
     if (!tss) {
         av_free(pes);
@@ -1775,6 +1786,49 @@ static void m4sl_cb(MpegTSFilter *filter, const uint8_t *section,
         av_free(mp4_descr[i].dec_config_descr);
 }
 
+/**
+ * Return the PTS of the most recent video PES packet seen for a program, or
+ * AV_NOPTS_VALUE if no video PTS has been received yet.
+ *
+ * The value is the 33 bit PTS exactly as carried in the stream, which is the
+ * form the SCTE-35 consumers want (both the pts_adjust field and the SCTE-104
+ * pre-roll are 33 bit 90kHz quantities).
+ */
+static int64_t get_program_video_pts(MpegTSContext *ts, const AVProgram *prg)
+{
+    const AVFormatContext *s = ts->stream;
+    const AVStream *vst = NULL;
+    unsigned int i;
+
+    for (i = 0; i < prg->nb_stream_indexes; i++) {
+        unsigned int idx = prg->stream_index[i];
+        if (idx < s->nb_streams &&
+            s->streams[idx]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            vst = s->streams[idx];
+            break;
+        }
+    }
+    if (!vst)
+        return AV_NOPTS_VALUE;
+
+    /* Find the PES filter feeding that stream.  Matching on the AVStream
+     * pointer rather than looking up ts->pids[vst->id] avoids relying on
+     * st->id still being the pid, which does not hold for streams carried
+     * over by merge_pmt_versions. */
+    for (i = 0; i < NB_PID_MAX; i++) {
+        const MpegTSFilter *f = ts->pids[i];
+        const PESContext *pes;
+
+        if (!f || f->type != MPEGTS_PES)
+            continue;
+        pes = f->u.pes_filter.opaque;
+        if (pes && pes->st == vst)
+            return pes->last_pts;
+    }
+
+    return AV_NOPTS_VALUE;
+}
+
 static void scte_data_cb(MpegTSFilter *filter, const uint8_t *section,
                     int section_len)
 {
@@ -1795,11 +1849,27 @@ static void scte_data_cb(MpegTSFilter *filter, const uint8_t *section,
     new_data_packet(section, section_len, ts->pkt);
     ts->pkt->stream_index = idx;
     prg = av_find_program_from_stream(ts->stream, NULL, idx);
-    if (prg && prg->pcr_pid != -1 && prg->discard != AVDISCARD_ALL) {
-        MpegTSFilter *f = ts->pids[prg->pcr_pid];
-        if (f && f->last_pcr != -1) {
+    if (prg && prg->discard != AVDISCARD_ALL) {
+        /* Timestamp the section against the adjacent video frame.  Using the
+         * PCR here instead would place the timestamp behind the video by the
+         * encoder buffer delay, which downstream shows up as an overstated
+         * SCTE-104 pre-roll, i.e. a splice that fires late. */
+        int64_t section_pts = get_program_video_pts(ts, prg);
+
+        if (section_pts == AV_NOPTS_VALUE &&
+            (unsigned)prg->pcr_pid < NB_PID_MAX) {
+            /* No video PTS seen yet (a section ahead of the first video packet,
+             * or a program carrying no video at all).  Fall back to the PCR so
+             * we still emit a timestamp rather than none at all: consumers such
+             * as the scte35toscte104 BSF cannot work without one. */
+            const MpegTSFilter *f = ts->pids[prg->pcr_pid];
+            if (f && f->last_pcr != -1)
+                section_pts = f->last_pcr / 300;
+        }
+
+        if (section_pts != AV_NOPTS_VALUE) {
             AVTransportTimestamp *transport_ts;
-            ts->pkt->pts = ts->pkt->dts = f->last_pcr/300;
+            ts->pkt->pts = ts->pkt->dts = section_pts;
             transport_ts = (AVTransportTimestamp *) av_packet_new_side_data(ts->pkt,
                                                                             AV_PKT_DATA_TRANSPORT_TIMESTAMP,
                                                                             sizeof(AVTransportTimestamp));
@@ -3013,6 +3083,7 @@ static int handle_packets(MpegTSContext *ts, int64_t nb_packets)
                     av_buffer_unref(&pes->buffer);
                     pes->data_index = 0;
                     pes->state = MPEGTS_SKIP; /* skip until pes header */
+                    pes->last_pts = AV_NOPTS_VALUE;
                 } else if (ts->pids[i]->type == MPEGTS_SECTION) {
                     ts->pids[i]->u.section_filter.last_ver = -1;
                 }
