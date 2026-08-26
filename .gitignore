@@ -43,3 +43,10 @@
 /tools/python/__pycache__/
 /include
 /share
+
+# media-autobuild_suite scratch files (accidentally committed in 493d9721a65)
+/already_configured_*
+/already_ran_make_*
+/already_ran_make_install_*
+*.done
+*.orig
